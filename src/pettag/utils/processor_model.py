@@ -186,5 +186,5 @@ class ModelProcessor:
                 batch_size=batch_size,
                 desc=f"[{date_time} | INFO | PetCoder]",
             )
-        logger.info("Predictions obtained and text coded successfully.")
+        self.logger.info("Predictions obtained and text coded successfully.")
         return processed_dataset
