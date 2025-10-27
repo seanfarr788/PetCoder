@@ -6,10 +6,13 @@ from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 from collections import defaultdict
 
+from torch.nn import functional as F
 from typing import Optional, Dict, Any
 import torch
 import logging
 import pandas as pd
+import numpy as np
+import os
 
 
 class DiseaseCoder:
@@ -35,7 +38,8 @@ class DiseaseCoder:
         split: str = "train",  # Split of the dataset to use (e.g., 'train', 'test', 'eval')
         model: str = "seanfarrell/bert-base-uncased",  # Path to the model
         tokenizer: str = None,  # Path to the tokenizer
-        code_lookup="seanfarrell/ICD-11_synonyms",
+        synonyms_dataset="seanfarrell/ICD-11_synonyms",
+        synonyms_embeddings_dataset="cache/ICD-11_synonyms_embeddings.pt",
         embedding_model: str = "sentence-transformers/embeddinggemma-300m-medical",
         text_column: str = "text",  # Column name in the dataset containing text data
         label_column: str = "labels",  # Column name in the dataset containing labels
@@ -69,15 +73,30 @@ class DiseaseCoder:
         )
         self.logger.info("Initializing embedding pipeline")
         self.embedding_model = SentenceTransformer(embedding_model).to(self.device)
-        self.code_lookup = load_dataset(code_lookup, split="train")
+
+        try:
+            self.logger.info(
+                f"Loading precomputed ICD lookup from {synonyms_embeddings_dataset} ..."
+            )
+            data = torch.load(
+                synonyms_embeddings_dataset, map_location=self.device, weights_only=True
+            )
+        except:
+            self.logger.info(
+                "No ICD embedding store found. Generating a new one. This should only happen on first run. Should take a few minutes..."
+            )
+            icd_lookup_daaset = load_dataset(synonyms_dataset, split="train")
+            data = self._preprocess_icd_lookup(
+                disease_code_lookup=icd_lookup_daaset,
+                save_path=synonyms_embeddings_dataset,
+            )
 
         self.logger.info("Initializing ModelProcessor")
         self.model_processor = ModelProcessor(
             model=self.model,
-            tokenizer=self.tokenizer,
+            icd_embedding=data,
             text_column=self.text_column,
             label_column=self.label_column,
-            disease_code_lookup=self.code_lookup,
             embedding_model=self.embedding_model,
             device=self.device,
         )
@@ -99,6 +118,104 @@ class DiseaseCoder:
         clean_text = text.strip()
         df = pd.DataFrame({self.text_column: [clean_text]})
         return Dataset.from_pandas(df)
+
+        # -----------------------------------------------------
+
+    # Create Embedding Store
+    # -----------------------------------------------------
+
+    def _preprocess_icd_lookup(self, disease_code_lookup, save_path="icd_lookup.pt"):
+        """
+        Preprocess an ICD lookup table into a compact, normalized, and efficiently loadable
+        PyTorch dictionary. The resulting .pt file includes:
+        - Normalized embeddings
+        - Metadata (Code, Title, ChapterNo, URI)
+        - Parent–subcode index mappings
+        - .Z code mask
+
+        Parameters
+        ----------
+        disease_code_lookup : pandas.DataFrame or dict-like
+            ICD lookup data containing at least the columns:
+            ['Code', 'Title', 'ChapterNo', 'URI', 'embeddings'].
+        save_path : str, optional
+            Output path for the saved lookup file (default: "icd_lookup.pt").
+
+        Returns
+        -------
+        dict
+            A dictionary containing tensors and metadata ready for downstream use.
+        """
+
+        self.logger.info("📦 Preprocessing ICD lookup into safe PyTorch format...")
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 1. Normalize embeddings
+        # -------------------------------------------------------------------------
+        embeddings = torch.tensor(
+            np.asarray(disease_code_lookup["embeddings"], dtype=np.float32)
+        )
+        embeddings = F.normalize(embeddings, dim=1)
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 2. Extract metadata columns
+        # -------------------------------------------------------------------------
+        codes = [str(c) for c in disease_code_lookup["Code"]]
+        titles = [str(t) for t in disease_code_lookup["Title"]]
+        chapters = [str(ch) for ch in disease_code_lookup["ChapterNo"]]
+        uris = [str(u) for u in disease_code_lookup["URI"]]
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 3. Build parent → subcode mapping
+        # -------------------------------------------------------------------------
+        parent_groups = {}
+        for idx, code in enumerate(codes):
+            parent = code.split(".")[0]
+            parent_groups.setdefault(parent, []).append(idx)
+
+        parent_to_subcodes_keys, parent_to_subcodes_values = [], []
+        for parent, indices in parent_groups.items():
+            if len(indices) > 1:
+                parent_to_subcodes_keys.append(parent)
+                parent_to_subcodes_values.append(
+                    torch.tensor(indices, dtype=torch.long)
+                )
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 4. Create a ".Z" code mask (terminal codes)
+        # -------------------------------------------------------------------------
+        z_code_mask = torch.tensor([c.endswith(".Z") for c in codes], dtype=torch.bool)
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 5. Handle save path and ensure directory exists
+        # -------------------------------------------------------------------------
+        save_path = save_path if save_path.endswith(".pt") else f"{save_path}.pt"
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 6. Save lookup dictionary
+        # -------------------------------------------------------------------------
+        lookup_dict = {
+            "lookup_embeddings": embeddings.cpu(),
+            "codes": codes,
+            "titles": titles,
+            "chapters": chapters,
+            "uris": uris,
+            "parent_to_subcodes_keys": parent_to_subcodes_keys,
+            "parent_to_subcodes_values": parent_to_subcodes_values,
+            "z_code_mask": z_code_mask,
+        }
+
+        torch.save(lookup_dict, save_path)
+        self.logger.info(f"💾 ICD lookup saved successfully → {save_path}")
+
+        # -------------------------------------------------------------------------
+        # ✅ Step 8. Return device-ready dictionary
+        # -------------------------------------------------------------------------
+        return {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+            for key, value in lookup_dict.items()
+        }
 
     def _prepare_dataset(self) -> Dataset:
         if isinstance(self.dataset, Dataset):
@@ -151,14 +268,15 @@ class DiseaseCoder:
             target_dataset, completed_dataset = self._prepare_dataset()
         else:
             raise ValueError("Please provide either a text string or a dataset path.")
-
-        target_dataset = self.model_processor.predict(dataset=target_dataset)
+        print("Starting disease coding process...")
         if text:
-            print(target_dataset)
+            target_dataset = self.model_processor.single_predict(dataset=target_dataset)
             self._print_output(text, target_dataset[0])
             return target_dataset[0]
-
         else:
+            target_dataset = self.model_processor.predict(
+                dataset=target_dataset, batch_size=16
+            )
             self.dataset_processor.save_dataset_file(
                 target_dataset=target_dataset,
                 completed_dataset=completed_dataset,

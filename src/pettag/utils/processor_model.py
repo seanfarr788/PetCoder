@@ -1,23 +1,19 @@
 from pettag.utils.logging_setup import get_logger
-
 import torch
-import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-from functools import lru_cache
 from tqdm.contrib.logging import logging_redirect_tqdm
-from transformers import pipeline
+from torch.nn import functional as F
+import pandas as pd
+import numpy as np
 
 
 class ModelProcessor:
     def __init__(
         self,
         model,
-        tokenizer=None,
+        icd_embedding="icd_lookup.pt",  # new default filename
         replaced=True,
         text_column="text",
         label_column="ICD_11_code",
-        disease_code_lookup=None,
         embedding_model=None,
         device=None,
     ):
@@ -25,56 +21,34 @@ class ModelProcessor:
         self.replaced = replaced
         self.text_column = text_column
         self.label_column = label_column
-        self.disease_code_lookup = disease_code_lookup
         self.embedding_model = embedding_model
-        self.ner_pipeline = model
-        self.device = device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = (
+            device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        )
         self.logger = get_logger()
 
-        self.logger.info("Precomputing ICD embeddings and lookup tables...")
-
-        # Preload ICD embeddings tensor
-        self.lookup_embeddings = F.normalize(
-            torch.as_tensor(
-                np.stack(disease_code_lookup["embeddings"]),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            dim=1,
-        )
-
-        self.codes = np.array(disease_code_lookup["Code"])
+        self.lookup_embeddings = icd_embedding["lookup_embeddings"].to(self.device)
+        self.codes = icd_embedding["codes"]
+        self.titles = icd_embedding.get("titles", None)
+        self.chapters = icd_embedding.get("chapters", None)
+        self.uris = icd_embedding.get("uris", None)
         self.num_codes = len(self.codes)
 
-        # Build parent → subcode map
-        parent_groups = {}
-        for idx, code in enumerate(self.codes):
-            parent = code.split(".")[0]
-            parent_groups.setdefault(parent, []).append(idx)
-
         self.parent_to_subcodes = {
-            p: torch.tensor(v, device=self.device, dtype=torch.long)
-            for p, v in parent_groups.items()
-            if len(v) > 1
+            k: v.to(self.device)
+            for k, v in zip(
+                icd_embedding["parent_to_subcodes_keys"],
+                icd_embedding["parent_to_subcodes_values"],
+            )
         }
 
-        # Boolean tensor mask for ".Z" codes
-        self.z_code_mask = torch.tensor(
-            [str(c).endswith(".Z") for c in self.codes],
-            dtype=torch.bool,
-            device=self.device,
-        )
-        self.logger.info(f"Loaded {self.num_codes} ICD codes on {self.device}.")
-
-        # Compile the high-frequency function (requires PyTorch 2.1+)
-        self._compiled_disease_coder_batch = torch.compile(
-            self._disease_coder_batch_core, dynamic=True
-        )
+        self.z_code_mask = icd_embedding["z_code_mask"].to(self.device)
+        self.logger.info(f"✅ Loaded {self.num_codes} ICD codes on {self.device}.")
 
     # -----------------------------------------------------
-    # Core vectorized batch logic (compiled)
+    # Internal similarity computation
     # -----------------------------------------------------
-    def _disease_coder_batch_core(self, encoded, Z_BOOST):
+    def _disease_coder_batch(self, encoded, Z_BOOST):
         sims = F.linear(encoded, self.lookup_embeddings)  # cosine similarities
         top_scores, top_idx = sims.max(dim=1)
 
@@ -101,46 +75,77 @@ class ModelProcessor:
     # -----------------------------------------------------
     @torch.inference_mode()
     def disease_coder_batch(self, diseases, Z_BOOST=0.06):
+        """
+        Encode a batch of disease descriptions and return the most similar ICD entries.
+
+        Parameters
+        ----------
+        diseases : list[str]
+            A list of free-text disease descriptions to map to ICD codes.
+        Z_BOOST : float, optional
+            A boost applied to ".Z" codes to slightly prioritize terminal classifications.
+
+        Returns
+        -------
+        list[dict]
+            A list of dictionaries containing ICD metadata and similarity scores for each input disease.
+        """
         if not diseases:
             return []
 
+        # -------------------------------------------------------------------------
+        # ✅ Step 1. Encode input diseases using the embedding model
+        # -------------------------------------------------------------------------
         encoded = self.embedding_model.encode(
             diseases,
             convert_to_tensor=True,
             device=self.device if torch.cuda.is_available() else None,
-            batch_size=128,  # increase for large GPUs
+            batch_size=128,
             show_progress_bar=False,
         )
         encoded = F.normalize(encoded, dim=1)
 
-        # Run compiled similarity computation
-        final_idx, final_score = self._compiled_disease_coder_batch(encoded, Z_BOOST)
+        # -------------------------------------------------------------------------
+        # ✅ Step 2. Perform vector similarity search
+        # -------------------------------------------------------------------------
+        final_idx, final_score = self._disease_coder_batch(encoded, Z_BOOST)
 
+        # -------------------------------------------------------------------------
+        # ✅ Step 3. Compile full metadata for top matches
+        # -------------------------------------------------------------------------
         results = []
         for i, disease in enumerate(diseases):
             idx = int(final_idx[i].item())
             score = float(final_score[i].item())
-            entry = self.disease_code_lookup[idx]
+
+            # Retrieve ICD metadata from preloaded lookup
+            code = self.codes[idx]
+            title = self.titles[idx] if hasattr(self, "titles") else None
+            chapter = self.chapters[idx] if hasattr(self, "chapters") else None
+            uri = self.uris[idx] if hasattr(self, "uris") else None
+
             results.append(
                 {
-                    "Title": entry["Title"],
-                    "Code": entry["Code"],
-                    "ChapterNo": entry["ChapterNo"],
-                    "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{entry["URI"]}',
-                    "Similarity": score,
                     "Input Disease": disease,
+                    "Code": code,
+                    "Title": title,
+                    "ChapterNo": chapter,
+                    "URI": uri,
+                    "Similarity": score,
                 }
             )
+
         return results
 
     def disease_coder(self, disease, Z_BOOST=0.06):
         return self.disease_coder_batch([disease], Z_BOOST)[0]
 
     # -----------------------------------------------------
+    # NER and batch processing
+    # -----------------------------------------------------
     def _process_batch(self, examples):
         texts = [t.lower() for t in examples[self.text_column]]
-        ner_results = self.ner_pipeline(texts)
-
+        ner_results = self.model(texts)
         all_diseases = []
         disease_spans = []
         batch_symptoms, batch_pathogens = [], []
@@ -178,13 +183,30 @@ class ModelProcessor:
 
     # -----------------------------------------------------
     def predict(self, dataset, batch_size=64):
-        with logging_redirect_tqdm():
-            date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-            processed_dataset = dataset.map(
-                self._process_batch,
-                batched=True,
-                batch_size=batch_size,
-                desc=f"[{date_time} | INFO | PetCoder]",
-            )
+        date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        processed_dataset = dataset.map(
+            self._process_batch,
+            batched=True,
+            batch_size=batch_size,
+            desc=f"[{date_time} | INFO | PetCoder]",
+            load_from_cache_file=False,
+        )
         self.logger.info("Predictions obtained and text coded successfully.")
+        return processed_dataset
+
+    def single_predict(self, dataset):
+        dataset = dataset.select([0])
+        processed = self._process_batch(examples=dataset)
+        processed_dataset = {
+            self.text_column: dataset[self.text_column],
+            "disease_extraction": processed["disease_extraction"],
+            "pathogen_extraction": processed["pathogen_extraction"],
+            "symptom_extraction": processed["symptom_extraction"],
+            self.label_column: processed[self.label_column],
+        }
+        self.logger.info("Single prediction obtained and text coded successfully.")
+
+        from datasets import Dataset
+
+        processed_dataset = Dataset.from_dict(processed_dataset)
         return processed_dataset
