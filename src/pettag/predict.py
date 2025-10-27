@@ -33,7 +33,7 @@ class DiseaseCoder:
         self,
         dataset: str = None,  # Path to the dataset file (CSV, Arrow, etc.)
         split: str = "train",  # Split of the dataset to use (e.g., 'train', 'test', 'eval')
-        model: str = "seaseanfarrell/bert-base-uncased",  # Path to the model
+        model: str = "seanfarrell/bert-base-uncased",  # Path to the model
         tokenizer: str = None,  # Path to the tokenizer
         code_lookup="seanfarrell/ICD-11_synonyms",
         embedding_model: str = "sentence-transformers/embeddinggemma-300m-medical",
