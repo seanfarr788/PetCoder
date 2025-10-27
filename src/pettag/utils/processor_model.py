@@ -32,7 +32,7 @@ class ModelProcessor:
         label_column="ICD_11_code",
         disease_code_lookup=None,
         embedding_model=None,
-        device="cuda:1" if torch.cuda.is_available() else "cpu",
+        device="cuda:0" if torch.cuda.is_available() else "cpu",
     ):
         self.model = model
         self.replaced = replaced
@@ -47,7 +47,7 @@ class ModelProcessor:
         logger.info("Precomputing and caching ICD embeddings tensor...")
         all_embeddings = np.vstack(self.disease_code_lookup["embeddings"])
         self.lookup_embeddings = torch.tensor(
-            all_embeddings, dtype=torch.float32, device=device
+            all_embeddings, dtype=torch.float16, device=device
         )
         # Normalize once at initialization
         self.lookup_embeddings = F.normalize(self.lookup_embeddings, dim=1)
@@ -75,24 +75,24 @@ class ModelProcessor:
             return []
         
         # --- Step 1: Encode all diseases at once ---
-        encoded_diseases = self.embedding_model.encode(
-            diseases, 
-            convert_to_numpy=False,  # Get tensor directly if possible
-            batch_size=32,  # Adjust based on your GPU memory
-            show_progress_bar=False
-        )
-        
+        if isinstance(self.embedding_model, SentenceTransformer):
+            encoded_diseases = self.embedding_model.encode_multi_process(
+                diseases, show_progress_bar=False, normalize_embeddings=True
+            )
+            
+        encoded_diseases = encoded_diseases.half()
+                
         # Convert to tensor and normalize
         if isinstance(encoded_diseases, list):
             if isinstance(encoded_diseases[0], torch.Tensor):
                 encoded_diseases = torch.stack(encoded_diseases).to(self.device)
             else:
                 encoded_diseases = torch.tensor(
-                    np.vstack(encoded_diseases), dtype=torch.float32, device=self.device
+                    np.vstack(encoded_diseases), dtype=torch.float16, device=self.device
                 )
         elif isinstance(encoded_diseases, np.ndarray):
             encoded_diseases = torch.tensor(
-                encoded_diseases, dtype=torch.float32, device=self.device
+                encoded_diseases, dtype=torch.float16, device=self.device
             )
         encoded_diseases = F.normalize(encoded_diseases, dim=1)
         
