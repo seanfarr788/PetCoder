@@ -36,7 +36,7 @@ class ModelProcessor:
         embedding_model=None,
         device="cpu",
     ):
-        self.model = model
+        self.ner_pipeline = model
         self.replaced = replaced
         self.text_column = text_column
         self.label_column = label_column
@@ -124,7 +124,7 @@ class ModelProcessor:
                     "Title": final_entry["Title"],
                     "Code": final_entry["Code"],
                     "ChapterNo": final_entry["ChapterNo"],
-                    "Foundation URI": final_entry["Foundation URI"],
+                    "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
                     "Similarity": float(final_score),
                     "Input Disease": diseases[i],
                 }
@@ -182,8 +182,8 @@ class ModelProcessor:
             processed_dataset = dataset.map(
                 self._process_batch,
                 batched=True,
-                num_proc=4,  # Parallelize across CPU cores
-                desc=f"[{date_time} | INFO | PetHarbor-Advance]",
+                #num_proc=4, 
+                desc=f"[{date_time} | INFO | PetCoder]",
             )
         logger.info("Predictions obtained and text coded successfully.")
         return processed_dataset
