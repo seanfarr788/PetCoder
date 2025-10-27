@@ -32,7 +32,7 @@ class ModelProcessor:
         label_column="ICD_11_code",
         disease_code_lookup=None,
         embedding_model=None,
-        device="cpu",
+        device="cuda:1" if torch.cuda.is_available() else "cpu",
     ):
         self.model = model
         self.replaced = replaced
@@ -83,14 +83,18 @@ class ModelProcessor:
         )
         
         # Convert to tensor and normalize
-        if not isinstance(encoded_diseases, torch.Tensor):
+        if isinstance(encoded_diseases, list):
+            if isinstance(encoded_diseases[0], torch.Tensor):
+                encoded_diseases = torch.stack(encoded_diseases).to(self.device)
+            else:
+                encoded_diseases = torch.tensor(
+                    np.vstack(encoded_diseases), dtype=torch.float32, device=self.device
+                )
+        elif isinstance(encoded_diseases, np.ndarray):
             encoded_diseases = torch.tensor(
                 encoded_diseases, dtype=torch.float32, device=self.device
             )
-        else:
-            encoded_diseases = encoded_diseases.to(self.device)
-        
-        encoded_diseases = F.normalize(encoded_diseases, dim=1)  # [N, D]
+        encoded_diseases = F.normalize(encoded_diseases, dim=1)
         
         # --- Step 2: Compute all similarities at once ---
         similarities = torch.matmul(
