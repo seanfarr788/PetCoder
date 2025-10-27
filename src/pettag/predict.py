@@ -55,11 +55,11 @@ class DiseaseCoder:
         self.logs = logs
         self.device = device
         self.output_dir = output_dir
-
         self.logger = self._setup_logger()
-        logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(__name__)
+        
         self.dataset_processor = DatasetProcessor(cache_path=self.cache_path)
-        logger.info(f"Initializing NER pipeline. Using {device}.")
+        self.logger.info(f"Initializing NER pipeline. Using {device}.")
         self.model = pipeline(
             "token-classification",
             model=model,
@@ -68,11 +68,11 @@ class DiseaseCoder:
             device=self.device,
             dtype=torch.float16 if self.device != "cpu" else torch.float32,
         )
-        logger.info("Initializing embedding pipeline")
+        self.logger.info("Initializing embedding pipeline")
         self.embedding_model = SentenceTransformer(embedding_model).to(self.device)
         self.code_lookup = load_dataset(code_lookup, split="train")
 
-        logger.info("Initializing ModelProcessor")
+        self.logger.info("Initializing ModelProcessor")
         self.model_processor = ModelProcessor(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -83,9 +83,6 @@ class DiseaseCoder:
             device=self.device,
         )
         self.num_runs = 0
-
-    def __repr__(self):
-        return f"<Anonymiser model={self.model} dataset={self.dataset} device={self.device}>"
 
     def _setup_logger(self) -> Any:
         return get_logger(log_dir=self.logs) if self.logs else get_logger()
