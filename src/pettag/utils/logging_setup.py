@@ -52,9 +52,9 @@ class ColoredFormatter(CustomFormatter):
         return f"{self.COLORS.get(record.levelname, '')}{log_msg}{self.COLORS['RESET']}"
 
 
-CUSTOM_WORD = None
+CUSTOM_WORD = "PetCoder"
 
-def get_logger(name="petharbor", level="debug", log_dir=None, method=None):
+def get_logger(name="petharbor", level="debug", log_dir=None):
     """Configures and returns a logger with both console and file handlers."""
     if log_dir:
         try:
@@ -63,10 +63,6 @@ def get_logger(name="petharbor", level="debug", log_dir=None, method=None):
             LOG_FILE = f"{LOG_DIR}/{name}.log"
         except Exception as e:
             raise Exception(f"Failed to create log directory: {e}")
-
-    if method:
-        global CUSTOM_WORD
-        CUSTOM_WORD = f"PetHarbor-{method}"
 
     level = LOG_LEVELS.get(level.lower(), logging.DEBUG)
 
@@ -98,7 +94,6 @@ def get_logger(name="petharbor", level="debug", log_dir=None, method=None):
 # Usage example
 if __name__ == "__main__":
     log = get_logger("test_logger", "debug")
-
     log.debug("This is a debug message.")
     log.info("This is an info message.")
     log.warning("This is a warning message.")

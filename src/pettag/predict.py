@@ -10,11 +10,6 @@ from typing import Optional, Dict, Any
 import torch
 import logging
 import pandas as pd
-import numpy as np
-
-from pettag.utils.logging_setup import get_logger
-
-logger = get_logger()
 
 
 class DiseaseCoder:
@@ -94,15 +89,15 @@ class DiseaseCoder:
 
     def _setup_logger(self) -> Any:
         return (
-            get_logger(log_dir=self.logs, method="Advance")
+            get_logger(log_dir=self.logs)
             if self.logs
-            else get_logger(method="Advance")
+            else get_logger()
         )
 
     def _print_output(self, input_text: str, output_text: str):
         timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp} | SUCCESS | PetHarbor-Advance] Input: {input_text}")
-        print(f"[{timestamp} | SUCCESS | PetHarbor-Advance] Output: {output_text}")
+        print(f"[{timestamp} | SUCCESS | PetCoder] Input: {input_text}")
+        print(f"[{timestamp} | SUCCESS | PetCoder] Output: {output_text}")
 
     def _prepare_single_text(self, text: str) -> Dataset:
         if not isinstance(text, str):
