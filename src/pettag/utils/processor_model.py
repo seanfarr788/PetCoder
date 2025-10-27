@@ -1,26 +1,43 @@
-from pettag.utils.logging_setup import get_logger
-
-from collections import defaultdict
-
-
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
-from functools import lru_cache
-from tqdm.contrib.logging import logging_redirect_tqdm
-from transformers import pipeline
 import logging
-
-
-
-import torch
-import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-from functools import lru_cache
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------
+# Persistent embedding cache (for repeated diseases)
+# -----------------------------------------------------
+class EmbeddingCache:
+    def __init__(self, path="disease_cache.pt"):
+        self.path = path
+        if os.path.exists(path):
+            try:
+                self.cache = torch.load(path)
+                logger.info(f"Loaded embedding cache: {len(self.cache)} entries")
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}")
+                self.cache = {}
+        else:
+            self.cache = {}
+
+    def get(self, key):
+        return self.cache.get(key)
+
+    def set(self, key, value):
+        self.cache[key] = value
+
+    def save(self):
+        torch.save(self.cache, self.path)
+        logger.info(f"Saved embedding cache ({len(self.cache)} entries) to {self.path}")
+
+
+# -----------------------------------------------------
+# Main ModelProcessor class
+# -----------------------------------------------------
 class ModelProcessor:
     def __init__(
         self,
@@ -31,183 +48,178 @@ class ModelProcessor:
         label_column="ICD_11_code",
         disease_code_lookup=None,
         embedding_model=None,
-        device=None,
+        device="cuda:0" if torch.cuda.is_available() else "cpu",
+        icd_cache_path="icd_lookup_cache.pt",
+        embedding_cache_path="disease_cache.pt",
     ):
-        # Auto-detect multi-GPU setup
-        if torch.cuda.is_available():
-            n_gpus = torch.cuda.device_count()
-            if n_gpus > 1:
-                logger.info(f"Detected {n_gpus} GPUs — using DataParallel.")
-                self.device = "cuda"
-                model = torch.nn.DataParallel(model)
-            else:
-                self.device = "cuda:0"
-        else:
-            self.device = "cpu"
-
         self.model = model
         self.replaced = replaced
         self.text_column = text_column
         self.label_column = label_column
+        self.device = device
         self.disease_code_lookup = disease_code_lookup
         self.embedding_model = embedding_model
         self.ner_pipeline = model
-        self.logger = get_logger()
 
-        self.logger.info("Precomputing ICD embeddings and lookup tables...")
+        # ---- Load or precompute ICD lookup embeddings ----
+        if os.path.exists(icd_cache_path):
+            logger.info(f"Loading cached ICD lookup from {icd_cache_path}")
+            cache = torch.load(icd_cache_path, map_location=device)
+            self.lookup_embeddings = cache["lookup_embeddings"].to(device)
+            self.codes = cache["codes"]
+            self.parent_to_subcodes = cache["parent_to_subcodes"]
+            self.z_code_mask = cache["z_code_mask"]
+        else:
+            logger.info("Precomputing and caching ICD lookup embeddings...")
+            all_embeddings = np.vstack(self.disease_code_lookup["embeddings"])
+            lookup_embeddings = torch.tensor(all_embeddings, dtype=torch.float32)
+            lookup_embeddings = F.normalize(lookup_embeddings, dim=1)
 
-        # Preload ICD embeddings tensor
-        self.lookup_embeddings = F.normalize(
-            torch.as_tensor(
-                np.stack(disease_code_lookup["embeddings"]),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            dim=1,
-        )
+            codes = np.array(self.disease_code_lookup["Code"])
+            parent_to_subcodes = {}
+            for idx, code in enumerate(codes):
+                parent = code.split(".")[0]
+                if parent not in parent_to_subcodes:
+                    parent_to_subcodes[parent] = []
+                if "." in code:
+                    parent_to_subcodes[parent].append(idx)
 
-        self.codes = np.array(disease_code_lookup["Code"])
-        self.num_codes = len(self.codes)
+            z_code_mask = np.array([str(c).endswith(".Z") for c in codes])
 
-        # Build parent → subcode map
-        parent_groups = {}
-        for idx, code in enumerate(self.codes):
-            parent = code.split(".")[0]
-            parent_groups.setdefault(parent, []).append(idx)
-
-        self.parent_to_subcodes = {
-            p: torch.tensor(v, device=self.device, dtype=torch.long)
-            for p, v in parent_groups.items()
-            if len(v) > 1
-        }
-
-        # Boolean tensor mask for ".Z" codes
-        self.z_code_mask = torch.tensor(
-            [str(c).endswith(".Z") for c in self.codes],
-            dtype=torch.bool,
-            device=self.device,
-        )
-        self.logger.info(f"Loaded {self.num_codes} ICD codes on {self.device}.")
-
-        # Compile the high-frequency function (requires PyTorch 2.1+)
-        self._compiled_disease_coder_batch = torch.compile(
-            self._disease_coder_batch_core, dynamic=True
-        )
-
-    # -----------------------------------------------------
-    # Cached encoding (massive speed gain on repeated text)
-    # -----------------------------------------------------
-    @lru_cache(maxsize=4096)
-    def _cached_encode(self, text):
-        emb = self.embedding_model.encode(
-            [text],
-            convert_to_tensor=True,
-            device=self.device if torch.cuda.is_available() else None,
-            show_progress_bar=False,
-        )
-        return F.normalize(emb, dim=1)[0]
-
-    # -----------------------------------------------------
-    # Core vectorized batch logic (compiled)
-    # -----------------------------------------------------
-    def _disease_coder_batch_core(self, encoded, Z_BOOST):
-        sims = F.linear(encoded, self.lookup_embeddings)  # cosine similarities
-        top_scores, top_idx = sims.max(dim=1)
-
-        final_idx = top_idx.clone()
-        final_score = top_scores.clone()
-
-        # Vectorized subcode refinement
-        for parent_code, sub_idx in self.parent_to_subcodes.items():
-            mask = torch.tensor(
-                [self.codes[i].split(".")[0] == parent_code for i in top_idx],
-                device=self.device,
+            torch.save(
+                {
+                    "lookup_embeddings": lookup_embeddings.cpu(),
+                    "codes": codes,
+                    "parent_to_subcodes": parent_to_subcodes,
+                    "z_code_mask": z_code_mask,
+                },
+                icd_cache_path,
             )
-            if mask.any():
-                sub_sims = sims[mask][:, sub_idx]
-                sub_sims = sub_sims + (self.z_code_mask[sub_idx] * Z_BOOST)
-                best_sub = sub_sims.argmax(dim=1)
-                final_idx[mask] = sub_idx[best_sub]
-                final_score[mask] = sub_sims.gather(1, best_sub.unsqueeze(1)).squeeze()
+            logger.info(f"Saved ICD lookup cache to {icd_cache_path}")
 
-        return final_idx, final_score
+            self.lookup_embeddings = lookup_embeddings.to(device)
+            self.codes = codes
+            self.parent_to_subcodes = parent_to_subcodes
+            self.z_code_mask = z_code_mask
+
+        # ---- Normalize once ----
+        self.lookup_embeddings = F.normalize(self.lookup_embeddings, dim=1)
+        logger.info(f"Lookup embeddings loaded: {self.lookup_embeddings.shape}")
+
+        # ---- Initialize persistent embedding cache ----
+        self.embedding_cache = EmbeddingCache(embedding_cache_path)
 
     # -----------------------------------------------------
-    # Public disease coding interface
+    # Batch disease coder (main speedup)
     # -----------------------------------------------------
-    @torch.inference_mode()
     def disease_coder_batch(self, diseases, Z_BOOST=0.06):
         if not diseases:
             return []
 
-        # Encode all diseases (GPU preferred)
-        try:
-            encoded = self.embedding_model.encode(
-                diseases,
-                convert_to_tensor=True,
-                device=self.device if torch.cuda.is_available() else None,
-                batch_size=128,  # increase for large GPUs
+        # --- Retrieve cached embeddings first ---
+        uncached = [d for d in diseases if d not in self.embedding_cache.cache]
+        if uncached:
+            new_embs = self.embedding_model.encode(
+                uncached,
+                convert_to_numpy=True,
+                batch_size=64,
                 show_progress_bar=False,
             )
-        except Exception:
-            # fallback to cached encode (for CPU-only models)
-            encoded = torch.stack([self._cached_encode(t) for t in diseases]).to(self.device)
+            for d, e in zip(uncached, new_embs):
+                self.embedding_cache.set(d, torch.tensor(e, dtype=torch.float32))
 
-        encoded = F.normalize(encoded, dim=1)
+        # --- Assemble embeddings ---
+        embeddings = torch.stack(
+            [self.embedding_cache.get(d) for d in diseases]
+        ).to(self.device)
+        embeddings = F.normalize(embeddings, dim=1)
 
-        # Run compiled similarity computation
-        final_idx, final_score = self._compiled_disease_coder_batch(encoded, Z_BOOST)
+        # --- Similarity computation ---
+        with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
+            similarities = torch.matmul(embeddings, self.lookup_embeddings.T)
 
         results = []
         for i, disease in enumerate(diseases):
-            idx = int(final_idx[i].item())
-            score = float(final_score[i].item())
-            entry = self.disease_code_lookup[idx]
+            sims = similarities[i]
+            top_idx = int(torch.argmax(sims).item())
+            top_score = float(sims[top_idx].item())
+            top_entry = self.disease_code_lookup[top_idx]
+            top_code = top_entry["Code"]
+            parent_code = top_code.split(".")[0]
+
+            final_entry, final_score = top_entry, top_score
+
+            if top_code == parent_code and parent_code in self.parent_to_subcodes:
+                subcode_indices = self.parent_to_subcodes[parent_code]
+                if subcode_indices:
+                    subcode_tensor = torch.tensor(subcode_indices, device=self.device)
+                    sub_sims = sims[subcode_tensor].clone()
+                    z_mask_sub = torch.tensor(
+                        self.z_code_mask[subcode_indices], device=self.device
+                    )
+                    sub_sims[z_mask_sub] += Z_BOOST
+                    sub_idx = int(torch.argmax(sub_sims).item())
+                    final_entry = self.disease_code_lookup[subcode_indices[sub_idx]]
+                    final_score = float(sub_sims[sub_idx].item())
+
             results.append(
                 {
-                    "Title": entry["Title"],
-                    "Code": entry["Code"],
-                    "ChapterNo": entry["ChapterNo"],
-                    "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{entry["URI"]}',
-                    "Similarity": score,
+                    "Title": final_entry["Title"],
+                    "Code": final_entry["Code"],
+                    "ChapterNo": final_entry["ChapterNo"],
+                    "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
+                    "Similarity": float(final_score),
                     "Input Disease": disease,
                 }
             )
+
+        # Save cache every batch (optional)
+        self.embedding_cache.save()
+
         return results
 
+    # -----------------------------------------------------
+    # Single disease coder
+    # -----------------------------------------------------
     def disease_coder(self, disease, Z_BOOST=0.06):
         return self.disease_coder_batch([disease], Z_BOOST)[0]
 
     # -----------------------------------------------------
+    # Optimized batch processing
+    # -----------------------------------------------------
     def _process_batch(self, examples):
-        texts = [t.lower() for t in examples[self.text_column]]
+        texts = [str(t).lower() for t in examples[self.text_column]]
         ner_results = self.ner_pipeline(texts)
 
         all_diseases = []
-        disease_spans = []
-        batch_symptoms, batch_pathogens = [], []
+        disease_indices = []
+        batch_diseases, batch_pathogens, batch_symptoms = [], [], []
 
-        for doc in ner_results:
-            diseases, symptoms, pathogens = set(), set(), set()
-            for ent in doc:
-                label = ent["entity_group"]
-                word = ent["word"]
+        for doc_idx, doc_result in enumerate(ner_results):
+            diseases, pathogens, symptoms = [], [], []
+
+            for entity in doc_result:
+                label = entity["entity_group"]
+                word = entity["word"]
                 if label == "DISEASE":
-                    diseases.add(word)
+                    diseases.append(word)
                 elif label == "SYMPTOM":
-                    symptoms.add(word)
+                    symptoms.append(word)
                 elif label == "ETIOLOGY":
-                    pathogens.add(word)
+                    pathogens.append(word)
 
-            start = len(all_diseases)
+            diseases = list(set(diseases))
+            start_idx = len(all_diseases)
             all_diseases.extend(diseases)
-            disease_spans.append((start, len(all_diseases)))
-            batch_symptoms.append(list(symptoms))
-            batch_pathogens.append(list(pathogens))
+            disease_indices.append((start_idx, len(all_diseases)))
+
+            batch_pathogens.append(list(set(pathogens)))
+            batch_symptoms.append(list(set(symptoms)))
 
         if all_diseases:
-            coded = self.disease_coder_batch(all_diseases)
-            batch_diseases = [coded[s:e] for s, e in disease_spans]
+            all_coded = self.disease_coder_batch(all_diseases)
+            for start_idx, end_idx in disease_indices:
+                batch_diseases.append(all_coded[start_idx:end_idx])
         else:
             batch_diseases = [[] for _ in range(len(texts))]
 
@@ -219,9 +231,11 @@ class ModelProcessor:
         }
 
     # -----------------------------------------------------
-    def predict(self, dataset, batch_size=64):
+    # Main prediction function
+    # -----------------------------------------------------
+    def predict(self, dataset, batch_size=32):
+        date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         with logging_redirect_tqdm():
-            date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
             processed_dataset = dataset.map(
                 self._process_batch,
                 batched=True,
