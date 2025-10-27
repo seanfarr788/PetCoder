@@ -42,12 +42,12 @@ class DiseaseCoder:
         cache: bool = True,  # Whether to use cache
         cache_path: str = "petharbor_cache/",  # Path to save cache files
         logs: Optional[str] = None,  # Path to save logs
-        device: Optional[str] = "cuda" if torch.cuda.is_available() else "cpu",
+        device: Optional[str] = "cuda:0" if torch.cuda.is_available() else "cpu",
         output_dir: str = None,  # Directory to save the output files
     ):
         self.dataset = dataset
         self.split = split
-        self.tokenizer = tokenizer
+        self.tokenizer = (tokenizer if tokenizer else model)
         self.text_column = text_column
         self.label_column = label_column
         self.cache = cache

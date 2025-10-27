@@ -44,15 +44,6 @@ class ModelProcessor:
         self.disease_code_lookup = disease_code_lookup
         self.embedding_model = embedding_model
 
-        # Initialize NER pipeline
-        self.ner_pipeline = pipeline(
-            "ner",
-            model=model,
-            tokenizer=tokenizer,
-            aggregation_strategy="simple",
-            device=0 if "cuda" in device else -1,
-        )
-
         # --- Precompute embeddings for lookup table ---
         logger.info("Precomputing and caching ICD embeddings tensor...")
         all_embeddings = np.vstack(self.disease_code_lookup["embeddings"])
