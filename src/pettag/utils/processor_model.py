@@ -22,6 +22,8 @@ from transformers import pipeline
 import logging
 
 logger = logging.getLogger(__name__)
+
+
 class ModelProcessor:
     def __init__(
         self,
@@ -52,7 +54,7 @@ class ModelProcessor:
         # Normalize once at initialization
         self.lookup_embeddings = F.normalize(self.lookup_embeddings, dim=1)
         logger.info(f"Lookup embeddings loaded: {self.lookup_embeddings.shape}")
-        
+
         # --- Precompute parent code mapping for faster subcode lookup ---
         self.codes = np.array(self.disease_code_lookup["Code"])
         self.parent_to_subcodes = {}
@@ -62,7 +64,7 @@ class ModelProcessor:
                 self.parent_to_subcodes[parent] = []
             if "." in code:  # It's a subcode
                 self.parent_to_subcodes[parent].append(idx)
-        
+
         # Precompute Z-code mask
         self.z_code_mask = np.array([str(c).endswith(".Z") for c in self.codes])
 
@@ -73,15 +75,15 @@ class ModelProcessor:
         """Process multiple diseases at once for massive speedup."""
         if not diseases:
             return []
-        
+
         # --- Step 1: Encode all diseases at once ---
         encoded_diseases = self.embedding_model.encode(
-            diseases, 
+            diseases,
             convert_to_numpy=False,  # Get tensor directly if possible
             batch_size=32,  # Adjust based on your GPU memory
-            show_progress_bar=False
+            show_progress_bar=False,
         )
-        
+
         # Convert to tensor and normalize
         if isinstance(encoded_diseases, list):
             if isinstance(encoded_diseases[0], torch.Tensor):
@@ -95,57 +97,58 @@ class ModelProcessor:
                 encoded_diseases, dtype=torch.float32, device=self.device
             )
         encoded_diseases = F.normalize(encoded_diseases, dim=1)
-        
+
         # --- Step 2: Compute all similarities at once ---
         similarities = torch.matmul(
             encoded_diseases, self.lookup_embeddings.T
         )  # [N, num_codes]
-        
+
         # --- Step 3: Process each disease ---
         results = []
         for i, disease in enumerate(diseases):
             sims = similarities[i]
             top_idx = int(torch.argmax(sims).item())
             top_score = float(sims[top_idx].item())
-            
+
             top_entry = self.disease_code_lookup[top_idx]
             top_code = top_entry["Code"]
             parent_code = top_code.split(".")[0]
-            
+
             final_entry, final_score = top_entry, top_score
-            
+
             # --- Check subcodes if we matched a parent code ---
             if top_code == parent_code and parent_code in self.parent_to_subcodes:
                 subcode_indices = self.parent_to_subcodes[parent_code]
-                
+
                 if subcode_indices:
                     # Convert to tensor for indexing
                     subcode_tensor = torch.tensor(subcode_indices, device=self.device)
-                    
+
                     # Get similarities for subcodes
                     sub_sims = sims[subcode_tensor].clone()
-                    
+
                     # Apply Z_BOOST efficiently
                     z_mask_sub = torch.tensor(
-                        self.z_code_mask[subcode_indices], 
-                        device=self.device
+                        self.z_code_mask[subcode_indices], device=self.device
                     )
                     sub_sims[z_mask_sub] += Z_BOOST
-                    
+
                     # Find best subcode
                     sub_idx = int(torch.argmax(sub_sims).item())
                     final_entry = self.disease_code_lookup[subcode_indices[sub_idx]]
                     final_score = float(sub_sims[sub_idx].item())
-            
-            results.append({
-                "Title": final_entry["Title"],
-                "Code": final_entry["Code"],
-                "ChapterNo": final_entry["ChapterNo"],
-                "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
-                "Similarity": float(final_score),
-                "Input Disease": disease,
-            })
-        
+
+            results.append(
+                {
+                    "Title": final_entry["Title"],
+                    "Code": final_entry["Code"],
+                    "ChapterNo": final_entry["ChapterNo"],
+                    "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
+                    "Similarity": float(final_score),
+                    "Input Disease": disease,
+                }
+            )
+
         return results
 
     # -----------------------------------------------------
@@ -165,38 +168,38 @@ class ModelProcessor:
         # Collect all unique diseases across batch for one encoding call
         all_diseases = []
         disease_indices = []  # Track which diseases belong to which doc
-        
+
         batch_diseases, batch_pathogens, batch_symptoms = [], [], []
 
         for doc_idx, doc_result in enumerate(ner_results):
             diseases, pathogens, symptoms = [], [], []
-            
+
             for entity in doc_result:
                 label = entity["entity_group"]
                 word = entity["word"]
-                
+
                 if label == "DISEASE":
                     diseases.append(word)
                 elif label == "SYMPTOM":
                     symptoms.append(word)
                 elif label == "ETIOLOGY":
                     pathogens.append(word)
-            
+
             # Deduplicate within document
             diseases = list(set(diseases))
-            
+
             # Track indices for this document
             start_idx = len(all_diseases)
             all_diseases.extend(diseases)
             disease_indices.append((start_idx, len(all_diseases)))
-            
+
             batch_pathogens.append(list(set(pathogens)))
             batch_symptoms.append(list(set(symptoms)))
-        
+
         # Code ALL diseases at once
         if all_diseases:
             all_coded = self.disease_coder_batch(all_diseases)
-            
+
             # Distribute coded diseases back to documents
             for start_idx, end_idx in disease_indices:
                 batch_diseases.append(all_coded[start_idx:end_idx])

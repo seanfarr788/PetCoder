@@ -47,7 +47,7 @@ class DiseaseCoder:
     ):
         self.dataset = dataset
         self.split = split
-        self.tokenizer = (tokenizer if tokenizer else model)
+        self.tokenizer = tokenizer if tokenizer else model
         self.text_column = text_column
         self.label_column = label_column
         self.cache = cache
@@ -59,7 +59,7 @@ class DiseaseCoder:
         self.logger = self._setup_logger()
         logger = logging.getLogger(__name__)
         self.dataset_processor = DatasetProcessor(cache_path=self.cache_path)
-        logger.info("Initializing NER pipeline")
+        logger.info(f"Initializing NER pipeline. Using {device}.")
         self.model = pipeline(
             "token-classification",
             model=model,
@@ -88,11 +88,7 @@ class DiseaseCoder:
         return f"<Anonymiser model={self.model} dataset={self.dataset} device={self.device}>"
 
     def _setup_logger(self) -> Any:
-        return (
-            get_logger(log_dir=self.logs)
-            if self.logs
-            else get_logger()
-        )
+        return get_logger(log_dir=self.logs) if self.logs else get_logger()
 
     def _print_output(self, input_text: str, output_text: str):
         timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
