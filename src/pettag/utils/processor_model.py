@@ -22,7 +22,6 @@ from transformers import pipeline
 import logging
 
 logger = logging.getLogger(__name__)
-
 class ModelProcessor:
     def __init__(
         self,
@@ -50,111 +49,149 @@ class ModelProcessor:
         self.lookup_embeddings = torch.tensor(
             all_embeddings, dtype=torch.float32, device=device
         )
+        # Normalize once at initialization
+        self.lookup_embeddings = F.normalize(self.lookup_embeddings, dim=1)
         logger.info(f"Lookup embeddings loaded: {self.lookup_embeddings.shape}")
+        
+        # --- Precompute parent code mapping for faster subcode lookup ---
+        self.codes = np.array(self.disease_code_lookup["Code"])
+        self.parent_to_subcodes = {}
+        for idx, code in enumerate(self.codes):
+            parent = code.split(".")[0]
+            if parent not in self.parent_to_subcodes:
+                self.parent_to_subcodes[parent] = []
+            if "." in code:  # It's a subcode
+                self.parent_to_subcodes[parent].append(idx)
+        
+        # Precompute Z-code mask
+        self.z_code_mask = np.array([str(c).endswith(".Z") for c in self.codes])
 
     # -----------------------------------------------------
-    # Extract entities from NER output
+    # Batch disease coding (MAJOR SPEEDUP)
     # -----------------------------------------------------
-    @staticmethod
-    def model_extractions(petbert_disease_out):
-        disease_out, pathogen_out, symptom_out = [], [], []
-        output = []
-
-        for entity in petbert_disease_out[0]:
-            start, end, label = entity["start"], entity["end"], entity["entity_group"]
-            output.append((start, end, label))
-            if label == "DISEASE":
-                disease_out.append(entity["word"])
-            elif label == "SYMPTOM":
-                symptom_out.append(entity["word"])
-            elif label == "ETIOLOGY":
-                pathogen_out.append(entity["word"])
-
-        # deduplicate
-        return list(set(disease_out)), list(set(pathogen_out)), list(set(symptom_out))
+    def disease_coder_batch(self, diseases, Z_BOOST=0.06):
+        """Process multiple diseases at once for massive speedup."""
+        if not diseases:
+            return []
+        
+        # --- Step 1: Encode all diseases at once ---
+        encoded_diseases = self.embedding_model.encode(
+            diseases, 
+            convert_to_numpy=False,  # Get tensor directly if possible
+            batch_size=32,  # Adjust based on your GPU memory
+            show_progress_bar=False
+        )
+        
+        # Convert to tensor and normalize
+        if not isinstance(encoded_diseases, torch.Tensor):
+            encoded_diseases = torch.tensor(
+                encoded_diseases, dtype=torch.float32, device=self.device
+            )
+        else:
+            encoded_diseases = encoded_diseases.to(self.device)
+        
+        encoded_diseases = F.normalize(encoded_diseases, dim=1)  # [N, D]
+        
+        # --- Step 2: Compute all similarities at once ---
+        similarities = torch.matmul(
+            encoded_diseases, self.lookup_embeddings.T
+        )  # [N, num_codes]
+        
+        # --- Step 3: Process each disease ---
+        results = []
+        for i, disease in enumerate(diseases):
+            sims = similarities[i]
+            top_idx = int(torch.argmax(sims))
+            top_score = float(sims[top_idx])
+            
+            top_entry = self.disease_code_lookup[top_idx]
+            top_code = top_entry["Code"]
+            parent_code = top_code.split(".")[0]
+            
+            final_entry, final_score = top_entry, top_score
+            
+            # --- Check subcodes if we matched a parent code ---
+            if top_code == parent_code and parent_code in self.parent_to_subcodes:
+                subcode_indices = self.parent_to_subcodes[parent_code]
+                
+                if subcode_indices:
+                    # Get similarities for subcodes
+                    sub_sims = sims[subcode_indices].clone()
+                    
+                    # Apply Z_BOOST efficiently
+                    z_mask_sub = self.z_code_mask[subcode_indices]
+                    sub_sims[z_mask_sub] += Z_BOOST
+                    
+                    # Find best subcode
+                    sub_idx = int(torch.argmax(sub_sims))
+                    final_entry = self.disease_code_lookup[subcode_indices[sub_idx]]
+                    final_score = float(sub_sims[sub_idx])
+            
+            results.append({
+                "Title": final_entry["Title"],
+                "Code": final_entry["Code"],
+                "ChapterNo": final_entry["ChapterNo"],
+                "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
+                "Similarity": float(final_score),
+                "Input Disease": disease,
+            })
+        
+        return results
 
     # -----------------------------------------------------
-    # Disease coder with efficient cosine similarity
+    # Keep single disease coder for backward compatibility
     # -----------------------------------------------------
     def disease_coder(self, disease, Z_BOOST=0.06):
-        """Return best ICD code match for an input disease phrase."""
-
-        def get_parent_code(code: str) -> str:
-            return code.split(".")[0]
-
-        # --- Step 1: encode disease and normalize ---
-        encoded_disease = self.embedding_model.encode(disease, convert_to_numpy=True)
-        encoded_tensor = torch.tensor(
-            encoded_disease, dtype=torch.float32, device=self.device
-        )
-        encoded_tensor = F.normalize(encoded_tensor.unsqueeze(0), dim=1)  # shape [1, D]
-
-        # --- Step 2: compute cosine similarities (torch, GPU-accelerated) ---
-        similarities = torch.matmul(encoded_tensor, self.lookup_embeddings.T).squeeze(0)
-        top_idx = int(torch.argmax(similarities))
-        top_score = float(similarities[top_idx])
-
-        top_entry = self.disease_code_lookup[top_idx]
-        top_code, top_title = top_entry["Code"], top_entry["Title"]
-        parent_code = get_parent_code(top_code)
-        final_entry, final_score = top_entry, top_score
-
-        # --- Step 3: check subcodes efficiently ---
-        subcodes_mask = [
-            str(code).startswith(parent_code + ".")
-            for code in self.disease_code_lookup["Code"]
-        ]
-        subcodes_idx = np.where(subcodes_mask)[0]
-
-        if len(subcodes_idx) > 0 and top_code == parent_code:
-            sub_embeddings = self.lookup_embeddings[subcodes_idx]
-            sub_sims = torch.matmul(encoded_tensor, sub_embeddings.T).squeeze(0)
-
-            # Apply Z_BOOST for unspecified subcodes
-            for i, code in enumerate(
-                np.array(self.disease_code_lookup["Code"])[subcodes_idx]
-            ):
-                if code.endswith(".Z"):
-                    sub_sims[i] += Z_BOOST
-
-            sub_idx = int(torch.argmax(sub_sims))
-            final_entry = self.disease_code_lookup[subcodes_idx[sub_idx]]
-            final_score = float(sub_sims[sub_idx])
-
-        return {
-            "Title": final_entry["Title"],
-            "Code": final_entry["Code"],
-            "ChapterNo": final_entry["ChapterNo"],
-            "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
-            "Similarity": float(final_score),
-            "Input Disease": disease,
-        }
+        """Single disease coding (wraps batch method)."""
+        return self.disease_coder_batch([disease], Z_BOOST)[0]
 
     # -----------------------------------------------------
-    # Batch processing
+    # Optimized batch processing
     # -----------------------------------------------------
     def _process_batch(self, examples):
         texts = [str(t).lower() for t in examples[self.text_column]]
         ner_results = self.ner_pipeline(texts)
 
-        # NOTE: assuming each NER output is a list of entities per text
+        # Collect all unique diseases across batch for one encoding call
+        all_diseases = []
+        disease_indices = []  # Track which diseases belong to which doc
+        
         batch_diseases, batch_pathogens, batch_symptoms = [], [], []
 
-        for doc_result in ner_results:
+        for doc_idx, doc_result in enumerate(ner_results):
             diseases, pathogens, symptoms = [], [], []
+            
             for entity in doc_result:
                 label = entity["entity_group"]
+                word = entity["word"]
+                
                 if label == "DISEASE":
-                    diseases.append(entity["word"])
+                    diseases.append(word)
                 elif label == "SYMPTOM":
-                    symptoms.append(entity["word"])
+                    symptoms.append(word)
                 elif label == "ETIOLOGY":
-                    pathogens.append(entity["word"])
-
-            coded_diseases = [self.disease_coder(d) for d in diseases]
-            batch_diseases.append(coded_diseases)
+                    pathogens.append(word)
+            
+            # Deduplicate within document
+            diseases = list(set(diseases))
+            
+            # Track indices for this document
+            start_idx = len(all_diseases)
+            all_diseases.extend(diseases)
+            disease_indices.append((start_idx, len(all_diseases)))
+            
             batch_pathogens.append(list(set(pathogens)))
             batch_symptoms.append(list(set(symptoms)))
+        
+        # Code ALL diseases at once
+        if all_diseases:
+            all_coded = self.disease_coder_batch(all_diseases)
+            
+            # Distribute coded diseases back to documents
+            for start_idx, end_idx in disease_indices:
+                batch_diseases.append(all_coded[start_idx:end_idx])
+        else:
+            batch_diseases = [[] for _ in range(len(texts))]
 
         return {
             "disease_extraction": batch_diseases,
@@ -166,12 +203,17 @@ class ModelProcessor:
     # -----------------------------------------------------
     # Main prediction function
     # -----------------------------------------------------
-    def predict(self, dataset):
+    def predict(self, dataset, batch_size=32):
+        """
+        Added batch_size parameter to control processing batches.
+        Larger batches = more GPU utilization but more memory.
+        """
         date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         with logging_redirect_tqdm():
             processed_dataset = dataset.map(
                 self._process_batch,
                 batched=True,
+                #batch_size=batch_size,  # Controllable batch size
                 desc=f"[{date_time} | INFO | PetHarbor-Advance]",
             )
         logger.info("Predictions obtained and text coded successfully.")
