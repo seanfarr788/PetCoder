@@ -1,8 +1,5 @@
 from pettag.utils.logging_setup import get_logger
 
-from collections import defaultdict
-
-
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -10,15 +7,6 @@ import pandas as pd
 from functools import lru_cache
 from tqdm.contrib.logging import logging_redirect_tqdm
 from transformers import pipeline
-import logging
-
-
-import torch
-import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-from functools import lru_cache
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 
 class ModelProcessor:
@@ -83,19 +71,6 @@ class ModelProcessor:
         )
 
     # -----------------------------------------------------
-    # Cached encoding (massive speed gain on repeated text)
-    # -----------------------------------------------------
-    @lru_cache(maxsize=4096)
-    def _cached_encode(self, text):
-        emb = self.embedding_model.encode(
-            [text],
-            convert_to_tensor=True,
-            device=self.device if torch.cuda.is_available() else None,
-            show_progress_bar=False,
-        )
-        return F.normalize(emb, dim=1)[0]
-
-    # -----------------------------------------------------
     # Core vectorized batch logic (compiled)
     # -----------------------------------------------------
     def _disease_coder_batch_core(self, encoded, Z_BOOST):
@@ -128,21 +103,13 @@ class ModelProcessor:
         if not diseases:
             return []
 
-        # Encode all diseases (GPU preferred)
-        try:
-            encoded = self.embedding_model.encode(
-                diseases,
-                convert_to_tensor=True,
-                device=self.device if torch.cuda.is_available() else None,
-                batch_size=128,  # increase for large GPUs
-                show_progress_bar=False,
-            )
-        except Exception:
-            # fallback to cached encode (for CPU-only models)
-            encoded = torch.stack([self._cached_encode(t) for t in diseases]).to(
-                self.device
-            )
-
+        encoded = self.embedding_model.encode(
+            diseases,
+            convert_to_tensor=True,
+            device=self.device if torch.cuda.is_available() else None,
+            batch_size=128,  # increase for large GPUs
+            show_progress_bar=False,
+        )
         encoded = F.normalize(encoded, dim=1)
 
         # Run compiled similarity computation
@@ -216,7 +183,7 @@ class ModelProcessor:
                 self._process_batch,
                 batched=True,
                 batch_size=batch_size,
-                desc=f"[{date_time} | INFO | PetHarbor-Advance]",
+                desc=f"[{date_time} | INFO | PetCoder]",
             )
         logger.info("Predictions obtained and text coded successfully.")
         return processed_dataset

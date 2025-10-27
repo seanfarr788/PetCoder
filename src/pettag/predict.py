@@ -56,7 +56,7 @@ class DiseaseCoder:
         self.device = device
         self.output_dir = output_dir
         self.logger = self._setup_logger()
-        
+
         self.dataset_processor = DatasetProcessor(cache_path=self.cache_path)
         self.logger.info(f"Initializing NER pipeline. Using {device}.")
         self.model = pipeline(
