@@ -125,7 +125,7 @@ class ModelProcessor:
             "Title": final_entry["Title"],
             "Code": final_entry["Code"],
             "ChapterNo": final_entry["ChapterNo"],
-            "Foundation URI": final_entry["Foundation URI"],
+            "Foundation URI": f'https://icd.who.int/browse/2025-01/mms/en#{final_entry["URI"]}',
             "Similarity": float(final_score),
             "Input Disease": disease,
         }
