@@ -101,8 +101,8 @@ class ModelProcessor:
         results = []
         for i, disease in enumerate(diseases):
             sims = similarities[i]
-            top_idx = int(torch.argmax(sims))
-            top_score = float(sims[top_idx])
+            top_idx = int(torch.argmax(sims).item())
+            top_score = float(sims[top_idx].item())
             
             top_entry = self.disease_code_lookup[top_idx]
             top_code = top_entry["Code"]
@@ -115,17 +115,23 @@ class ModelProcessor:
                 subcode_indices = self.parent_to_subcodes[parent_code]
                 
                 if subcode_indices:
+                    # Convert to tensor for indexing
+                    subcode_tensor = torch.tensor(subcode_indices, device=self.device)
+                    
                     # Get similarities for subcodes
-                    sub_sims = sims[subcode_indices].clone()
+                    sub_sims = sims[subcode_tensor].clone()
                     
                     # Apply Z_BOOST efficiently
-                    z_mask_sub = self.z_code_mask[subcode_indices]
+                    z_mask_sub = torch.tensor(
+                        self.z_code_mask[subcode_indices], 
+                        device=self.device
+                    )
                     sub_sims[z_mask_sub] += Z_BOOST
                     
                     # Find best subcode
-                    sub_idx = int(torch.argmax(sub_sims))
+                    sub_idx = int(torch.argmax(sub_sims).item())
                     final_entry = self.disease_code_lookup[subcode_indices[sub_idx]]
-                    final_score = float(sub_sims[sub_idx])
+                    final_score = float(sub_sims[sub_idx].item())
             
             results.append({
                 "Title": final_entry["Title"],
@@ -213,7 +219,7 @@ class ModelProcessor:
             processed_dataset = dataset.map(
                 self._process_batch,
                 batched=True,
-                #batch_size=batch_size,  # Controllable batch size
+                batch_size=batch_size,  # Controllable batch size
                 desc=f"[{date_time} | INFO | PetHarbor-Advance]",
             )
         logger.info("Predictions obtained and text coded successfully.")
