@@ -28,6 +28,7 @@ class ModelProcessor:
         self.disease_code_lookup = disease_code_lookup
         self.embedding_model = embedding_model
         self.ner_pipeline = model
+        self.device = device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.logger = get_logger()
 
         self.logger.info("Precomputing ICD embeddings and lookup tables...")
