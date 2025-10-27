@@ -75,13 +75,10 @@ class ModelProcessor:
             return []
         
         # --- Step 1: Encode all diseases at once ---
-        if isinstance(self.embedding_model, SentenceTransformer):
-            encoded_diseases = self.embedding_model.encode_multi_process(
-                diseases, show_progress_bar=False, normalize_embeddings=True
-            )
-            
-        encoded_diseases = encoded_diseases.half()
-                
+        encoded_diseases = self.embedding_model.encode(
+            diseases, convert_to_numpy=False, batch_size=32, show_progress_bar=False
+        )
+                    
         # Convert to tensor and normalize
         if isinstance(encoded_diseases, list):
             if isinstance(encoded_diseases[0], torch.Tensor):
