@@ -162,7 +162,7 @@ class ModelProcessor:
         for i, disease in enumerate(diseases):
             idx = int(final_idx[i].item())
             score = float(final_score[i].item())
-            entry = self.disease_code_lookup.iloc[idx]
+            entry = self.disease_code_lookup[idx]
             results.append(
                 {
                     "Title": entry["Title"],
