@@ -13,6 +13,7 @@ import logging
 import pandas as pd
 import numpy as np
 import os
+import json
 
 
 class DiseaseCoder:
@@ -34,6 +35,7 @@ class DiseaseCoder:
 
     def __init__(
         self,
+        framework: str = 'icd11', #options: 'icd11', 'icd10', 'snomed'
         dataset: str = None,  # Path to the dataset file (CSV, Arrow, etc.)
         split: str = "train",  # Split of the dataset to use (e.g., 'train', 'test', 'eval')
         model: str = "seanfarrell/bert-base-uncased",  # Path to the model
@@ -49,6 +51,7 @@ class DiseaseCoder:
         device: Optional[str] = "cuda:0" if torch.cuda.is_available() else "cpu",
         output_dir: str = None,  # Directory to save the output files
     ):
+        self.framework = framework
         self.dataset = dataset
         self.split = split
         self.tokenizer = tokenizer if tokenizer else model
@@ -69,7 +72,7 @@ class DiseaseCoder:
             tokenizer=self.tokenizer,
             aggregation_strategy="simple",
             device=self.device,
-            dtype=torch.float16 if self.device != "cpu" else torch.float32,
+            dtype=torch.float16 if "cuda" in self.device else torch.float32,
         )
         self.logger.info("Initializing embedding pipeline")
         self.embedding_model = SentenceTransformer(embedding_model).to(self.device)
@@ -85,14 +88,15 @@ class DiseaseCoder:
             self.logger.info(
                 "No ICD embedding store found. Generating a new one. This should only happen on first run. Should take a few minutes..."
             )
-            icd_lookup_daaset = load_dataset(synonyms_dataset, split="train")
+            icd_lookup_daaset = load_dataset(synonyms_dataset, split="train", download_mode='force_redownload')
             data = self._preprocess_icd_lookup(
                 disease_code_lookup=icd_lookup_daaset,
                 save_path=synonyms_embeddings_dataset,
             )
 
-        self.logger.info("Initializing ModelProcessor")
+        self.logger.info(f"Initializing {self.framework.upper()} ModelProcessor")
         self.model_processor = ModelProcessor(
+            framework=self.framework,
             model=self.model,
             icd_embedding=data,
             text_column=self.text_column,
@@ -107,8 +111,10 @@ class DiseaseCoder:
 
     def _print_output(self, input_text: str, output_text: str):
         timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp} | SUCCESS | PetCoder] Input: {input_text}")
-        print(f"[{timestamp} | SUCCESS | PetCoder] Output: {output_text}")
+        pretty_output = json.dumps(output_text, indent=4, ensure_ascii=False, sort_keys=True)
+
+        print(f"[{timestamp} | SUCCESS | PetCoder] Input:  {input_text}")
+        print(f"[{timestamp} | SUCCESS | PetCoder] Output:\n{pretty_output}")
 
     def _prepare_single_text(self, text: str) -> Dataset:
         if not isinstance(text, str):
@@ -129,7 +135,7 @@ class DiseaseCoder:
         Preprocess an ICD lookup table into a compact, normalized, and efficiently loadable
         PyTorch dictionary. The resulting .pt file includes:
         - Normalized embeddings
-        - Metadata (Code, Title, ChapterNo, URI)
+        - Metadata (ICD11, ICD10, SNOMED)
         - Parent–subcode index mappings
         - .Z code mask
 
@@ -137,7 +143,8 @@ class DiseaseCoder:
         ----------
         disease_code_lookup : pandas.DataFrame or dict-like
             ICD lookup data containing at least the columns:
-            ['Code', 'Title', 'ChapterNo', 'URI', 'embeddings'].
+            ['icd11Code', 'icd11Title', 'Title_synonym', 'icd11URI', 'embeddings',
+            'ChapterNo', 'icd10Code', 'icd10Title', 'snomedCode', 'snomedTitle'].
         save_path : str, optional
             Output path for the saved lookup file (default: "icd_lookup.pt").
 
@@ -152,24 +159,28 @@ class DiseaseCoder:
         # -------------------------------------------------------------------------
         # ✅ Step 1. Normalize embeddings
         # -------------------------------------------------------------------------
-        embeddings = torch.tensor(
-            np.asarray(disease_code_lookup["embeddings"], dtype=np.float32)
-        )
+        embeddings = torch.tensor( np.asarray(disease_code_lookup["embeddings"], dtype=np.float32) ) 
         embeddings = F.normalize(embeddings, dim=1)
+        self.logger.info(f"Embeddings shape: {embeddings.shape}")
 
         # -------------------------------------------------------------------------
         # ✅ Step 2. Extract metadata columns
         # -------------------------------------------------------------------------
-        codes = [str(c) for c in disease_code_lookup["Code"]]
-        titles = [str(t) for t in disease_code_lookup["Title"]]
+        icd11_codes = [str(c) for c in disease_code_lookup["icd11Code"]]
+        icd11_titles = [str(t) for t in disease_code_lookup["icd11Title"]]
+        synonyms = [str(s) for s in disease_code_lookup["Title_synonym"]]
+        uris = [str(u) for u in disease_code_lookup["icd11URI"]]
         chapters = [str(ch) for ch in disease_code_lookup["ChapterNo"]]
-        uris = [str(u) for u in disease_code_lookup["URI"]]
+        icd10_codes = [str(c) for c in disease_code_lookup["icd10Code"]]
+        icd10_titles = [str(t) for t in disease_code_lookup["icd10Title"]]
+        snomed_codes = [str(c) for c in disease_code_lookup["snomedCode"]]
+        snomed_titles = [str(t) for t in disease_code_lookup["snomedTitle"]]
 
         # -------------------------------------------------------------------------
-        # ✅ Step 3. Build parent → subcode mapping
+        # ✅ Step 3. Build parent → subcode mapping (based on ICD-11 code)
         # -------------------------------------------------------------------------
         parent_groups = {}
-        for idx, code in enumerate(codes):
+        for idx, code in enumerate(icd11_codes):
             parent = code.split(".")[0]
             parent_groups.setdefault(parent, []).append(idx)
 
@@ -177,14 +188,12 @@ class DiseaseCoder:
         for parent, indices in parent_groups.items():
             if len(indices) > 1:
                 parent_to_subcodes_keys.append(parent)
-                parent_to_subcodes_values.append(
-                    torch.tensor(indices, dtype=torch.long)
-                )
+                parent_to_subcodes_values.append(torch.tensor(indices, dtype=torch.long))
 
         # -------------------------------------------------------------------------
-        # ✅ Step 4. Create a ".Z" code mask (terminal codes)
+        # ✅ Step 4. Create a ".Z" code mask (terminal ICD-11 codes)
         # -------------------------------------------------------------------------
-        z_code_mask = torch.tensor([c.endswith(".Z") for c in codes], dtype=torch.bool)
+        z_code_mask = torch.tensor([c.endswith(".Z") for c in icd11_codes], dtype=torch.bool)
 
         # -------------------------------------------------------------------------
         # ✅ Step 5. Handle save path and ensure directory exists
@@ -197,10 +206,15 @@ class DiseaseCoder:
         # -------------------------------------------------------------------------
         lookup_dict = {
             "lookup_embeddings": embeddings.cpu(),
-            "codes": codes,
-            "titles": titles,
-            "chapters": chapters,
-            "uris": uris,
+            "icd11Code": icd11_codes,
+            "icd11Title": icd11_titles,
+            "Title_synonym": synonyms,
+            "icd11URI": uris,
+            "ChapterNo": chapters,
+            "icd10Code": icd10_codes,
+            "icd10Title": icd10_titles,
+            "snomedCode": snomed_codes,
+            "snomedTitle": snomed_titles,
             "parent_to_subcodes_keys": parent_to_subcodes_keys,
             "parent_to_subcodes_values": parent_to_subcodes_values,
             "z_code_mask": z_code_mask,
@@ -210,7 +224,7 @@ class DiseaseCoder:
         self.logger.info(f"💾 ICD lookup saved successfully → {save_path}")
 
         # -------------------------------------------------------------------------
-        # ✅ Step 8. Return device-ready dictionary
+        # ✅ Step 7. Return device-ready dictionary
         # -------------------------------------------------------------------------
         return {
             key: value.to(self.device) if isinstance(value, torch.Tensor) else value
@@ -258,7 +272,7 @@ class DiseaseCoder:
         # Prepare input
         if text:  # If text is provided
             self.logger.warning(
-                "Anonymising single text input. For bulk processing, use a dataset."
+                "Coding single text input. For bulk processing, use a dataset."
             )
             target_dataset = self._prepare_single_text(text)
         elif dataset:  # If dataset is provided to class
@@ -268,7 +282,6 @@ class DiseaseCoder:
             target_dataset, completed_dataset = self._prepare_dataset()
         else:
             raise ValueError("Please provide either a text string or a dataset path.")
-        print("Starting disease coding process...")
         if text:
             target_dataset = self.model_processor.single_predict(dataset=target_dataset)
             self._print_output(text, target_dataset[0])
@@ -306,3 +319,10 @@ class DiseaseCoder:
         else:
             self.logger.warning("No text or dataset provided for anonymisation.")
             return None
+
+if __name__ == "__main__":
+    # Example usage
+    coder = DiseaseCoder()
+
+    text = "Cookie present with vomiting and diarrhea. Suspected gastroenteritis."
+    coder.predict(text.upper())

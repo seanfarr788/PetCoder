@@ -12,7 +12,7 @@ args = parser.parse_args()
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
-    
+
 # read in the pyproject.toml, update the version to match VERSION
 with open("pyproject.toml", "r", encoding="utf-8") as f:
     pyproject_lines = f.readlines()

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "PetTag"
-version = "0.0.8"
+version = "0.0.11"
 description = "PetTag is a Python package designed for automated disease coding of veterinary clinical texts using either a pre-trained model."
 authors = ["Sean Farrell <sean.farrell2@durham.ac.uk>"]
 license = "MIT"
@@ -12,6 +12,7 @@ python = ">=3.9"
 python = ">=3.9"
 datasets = ">=4.0.0"
 sentence-transformers = ">=5.0.0"
+transformers = ">=4.52.0"
 
 [build-system]
 requires = ["poetry-core"]

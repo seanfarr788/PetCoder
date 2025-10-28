@@ -1,6 +1,6 @@
 from pettag import DiseaseCoder
 
-pipe = DiseaseCoder()
+pipe = DiseaseCoder(framework='icd11')
 
-text = "COOKIE PRESENTED TO JACKSON'S ON 25TH MAY 2025 BEFORE TRAVEL TO HUNGARY WITH PNEUMONIA. ISSUED PASSPORT (GB52354324)"
+text = "Cookie present with vomiting and diarrhea. Suspected gastroenteritis caused by parvovirus."
 pipe.predict(text.upper())

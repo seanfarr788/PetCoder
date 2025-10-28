@@ -4,11 +4,13 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from torch.nn import functional as F
 import pandas as pd
 import numpy as np
+from datasets import Dataset
 
 
 class ModelProcessor:
     def __init__(
         self,
+        framework,
         model,
         icd_embedding="icd_lookup.pt",  # new default filename
         replaced=True,
@@ -25,14 +27,21 @@ class ModelProcessor:
         self.device = (
             device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
         )
+        self.framework = framework
         self.logger = get_logger()
 
         self.lookup_embeddings = icd_embedding["lookup_embeddings"].to(self.device)
-        self.codes = icd_embedding["codes"]
-        self.titles = icd_embedding.get("titles", None)
-        self.chapters = icd_embedding.get("chapters", None)
-        self.uris = icd_embedding.get("uris", None)
-        self.num_codes = len(self.codes)
+        self.icd11_codes = icd_embedding["icd11Code"]
+        self.icd11_titles = icd_embedding.get("icd11Title", None)
+        self.title_synonyms = icd_embedding.get("Title_synonym", None)
+        self.icd11_uris = icd_embedding.get("icd11URI", None)
+        self.chapters = icd_embedding.get("ChapterNo", None)
+        self.icd10_codes = icd_embedding.get("icd10Code", None)
+        self.icd10_titles = icd_embedding.get("icd10Title", None)
+        self.snomed_codes = icd_embedding.get("snomedCode", None)
+        self.snomed_titles = icd_embedding.get("snomedTitle", None)
+
+        self.num_codes = len(self.icd11_codes)
 
         self.parent_to_subcodes = {
             k: v.to(self.device)
@@ -58,7 +67,7 @@ class ModelProcessor:
         # Vectorized subcode refinement
         for parent_code, sub_idx in self.parent_to_subcodes.items():
             mask = torch.tensor(
-                [self.codes[i].split(".")[0] == parent_code for i in top_idx],
+                [self.icd11_codes[i].split(".")[0] == parent_code for i in top_idx],
                 device=self.device,
             )
             if mask.any():
@@ -74,24 +83,31 @@ class ModelProcessor:
     # Public disease coding interface
     # -----------------------------------------------------
     @torch.inference_mode()
-    def disease_coder_batch(self, diseases, Z_BOOST=0.06):
+    def disease_coder_batch(self, diseases, Z_BOOST=0.06, framework=None):
         """
-        Encode a batch of disease descriptions and return the most similar ICD entries.
+        Encode a batch of disease descriptions and return the most similar ICD/SNOMED entries.
 
         Parameters
         ----------
         diseases : list[str]
-            A list of free-text disease descriptions to map to ICD codes.
+            A list of free-text disease descriptions to map to codes.
         Z_BOOST : float, optional
             A boost applied to ".Z" codes to slightly prioritize terminal classifications.
 
         Returns
         -------
         list[dict]
-            A list of dictionaries containing ICD metadata and similarity scores for each input disease.
+            A list of dictionaries containing framework-specific metadata and similarity scores.
         """
         if not diseases:
             return []
+        framework = framework or self.framework
+        framework = framework.lower()
+        valid_frameworks = ["icd11", "icd10", "snomed"]
+        if framework not in valid_frameworks:
+            raise ValueError(
+                f"Invalid framework '{framework}'. Must be one of {valid_frameworks}."
+            )
 
         # -------------------------------------------------------------------------
         # ✅ Step 1. Encode input diseases using the embedding model
@@ -111,27 +127,57 @@ class ModelProcessor:
         final_idx, final_score = self._disease_coder_batch(encoded, Z_BOOST)
 
         # -------------------------------------------------------------------------
-        # ✅ Step 3. Compile full metadata for top matches
+        # ✅ Step 3. Compile metadata for top matches according to framework
         # -------------------------------------------------------------------------
         results = []
         for i, disease in enumerate(diseases):
             idx = int(final_idx[i].item())
-            score = float(final_score[i].item())
+            score = min(float(final_score[i].item()), 1.0)
 
-            # Retrieve ICD metadata from preloaded lookup
-            code = self.codes[idx]
-            title = self.titles[idx] if hasattr(self, "titles") else None
-            chapter = self.chapters[idx] if hasattr(self, "chapters") else None
-            uri = self.uris[idx] if hasattr(self, "uris") else None
+            if framework == "icd11":
+                code = self.icd11_codes[idx]
+                title = (
+                    self.icd11_titles[idx] if hasattr(self, "icd11_titles") else None
+                )
+                chapter = self.chapters[idx] if hasattr(self, "chapters") else None
+                uri = self.icd11_uris[idx] if hasattr(self, "icd11_uris") else None
+
+            elif framework == "icd10":
+                code = self.icd10_codes[idx] if hasattr(self, "icd10_codes") else None
+                title = (
+                    self.icd10_titles[idx] if hasattr(self, "icd10_titles") else None
+                )
+                chapter = self.chapters[idx] if hasattr(self, "chapters") else None
+                uri = ""
+                synonym = ""
+
+            elif framework == "snomed":
+                code = self.snomed_codes[idx] if hasattr(self, "snomed_codes") else None
+                title = (
+                    self.snomed_titles[idx] if hasattr(self, "snomed_titles") else None
+                )
+                chapter = ""
+                uri = ""
+                synonym = ""
+                # if the first character of the code is a ( then add warning message that this is actually an ICD 11 code
+            if code and str(code.strip()).startswith("("):
+                self.logger.warning(
+                    f"⚠️ The matched {framework} code '{code}' is an ICD-11 code."
+                )
 
             results.append(
                 {
                     "Input Disease": disease,
+                    "Framework": framework.upper(),
                     "Code": code,
                     "Title": title,
-                    "ChapterNo": chapter,
-                    "URI": uri,
-                    "Similarity": score,
+                    "Chapter": chapter,
+                    "URI": (
+                        f"https://icd.who.int/browse/2025-01/mms/en#{uri}"
+                        if uri
+                        else None
+                    ),
+                    "Similarity": round(score, 4),
                 }
             )
 
@@ -178,7 +224,7 @@ class ModelProcessor:
             "disease_extraction": batch_diseases,
             "pathogen_extraction": batch_pathogens,
             "symptom_extraction": batch_symptoms,
-            self.label_column: batch_diseases,
+            # self.label_column: batch_diseases,
         }
 
     # -----------------------------------------------------
@@ -197,16 +243,12 @@ class ModelProcessor:
     def single_predict(self, dataset):
         dataset = dataset.select([0])
         processed = self._process_batch(examples=dataset)
-        processed_dataset = {
-            self.text_column: dataset[self.text_column],
-            "disease_extraction": processed["disease_extraction"],
-            "pathogen_extraction": processed["pathogen_extraction"],
-            "symptom_extraction": processed["symptom_extraction"],
-            self.label_column: processed[self.label_column],
-        }
-        self.logger.info("Single prediction obtained and text coded successfully.")
-
-        from datasets import Dataset
-
-        processed_dataset = Dataset.from_dict(processed_dataset)
-        return processed_dataset
+        return Dataset.from_dict(
+            {
+                self.text_column: dataset[self.text_column],
+                "Code": processed["disease_extraction"],
+                "pathogen_extraction": processed["pathogen_extraction"],
+                "symptom_extraction": processed["symptom_extraction"],
+                # self.label_column: processed[self.label_column],
+            }
+        )
