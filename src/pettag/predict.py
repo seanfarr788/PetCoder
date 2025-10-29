@@ -5,7 +5,7 @@ from datasets import Dataset, load_dataset
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 from collections import defaultdict
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, Tuple
 import torch
 import torch.nn.functional as F
 import pandas as pd
