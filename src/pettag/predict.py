@@ -17,13 +17,13 @@ from functools import lru_cache
 
 
 class DiseaseCoder:
-    """Anonymises text data using a pre-trained model.
+    """Codes disease text data using pre-trained NER and embedding models.
 
     Args:
         framework (str): Coding framework ('icd11', 'icd10', 'snomed'). Defaults to 'icd11'.
         dataset (Union[str, Dataset], optional): Path to dataset file or HuggingFace Dataset.
         split (str): Dataset split to use. Defaults to 'train'.
-        model (str): HuggingFace model path. Defaults to 'seanfarrell/bert-base-uncased'.
+        model (str): HuggingFace NER model path. Defaults to 'seanfarrell/bert-base-uncased'.
         tokenizer (str, optional): Tokenizer path. Defaults to model if not provided.
         batch_size (int): Batch size for processing. Defaults to 16.
         synonyms_dataset (str): Path to synonyms dataset.
@@ -79,7 +79,7 @@ class DiseaseCoder:
         # Logger setup
         self.logger = self._setup_logger()
         
-        # Dataset processor (lazy init if needed)
+        # Dataset processor
         self.dataset_processor = DatasetProcessor(cache_path=self.cache_path)
         
         # Model initialization with optimizations
@@ -100,10 +100,14 @@ class DiseaseCoder:
         self.logger.info("Initializing embedding pipeline")
         self.embedding_model = SentenceTransformer(embedding_model, device=self.device)
         
-        # Use compile for PyTorch 2.0+ speedup
+        # Use compile for PyTorch 2.0+ speedup (optional)
         if hasattr(torch, 'compile') and "cuda" in self.device:
             try:
-                self.embedding_model = torch.compile(self.embedding_model, mode="reduce-overhead")
+                self.embedding_model = torch.compile(
+                    self.embedding_model, 
+                    mode="reduce-overhead"
+                )
+                self.logger.info("Applied torch.compile() to embedding model")
             except Exception as e:
                 self.logger.warning(f"Could not compile embedding model: {e}")
         
@@ -130,13 +134,14 @@ class DiseaseCoder:
         )
 
     def _setup_logger(self) -> Any:
-        """Setup logger with lazy import."""
+        """Setup logger."""
+        from pettag.utils.logging_setup import get_logger
         return get_logger(log_dir=self.logs) if self.logs else get_logger()
 
     def _load_or_create_icd_lookup(
         self, synonyms_dataset: str, synonyms_embeddings_dataset: str
     ) -> Dict[str, Any]:
-        """Load precomputed embeddings or create new ones."""
+        """Load precomputed embeddings or create new ones efficiently."""
         try:
             self.logger.info(f"Loading ICD lookup from {synonyms_embeddings_dataset}")
             data = torch.load(
@@ -144,7 +149,7 @@ class DiseaseCoder:
                 map_location=self.device,
                 weights_only=True
             )
-            # Move tensors to device efficiently
+            # Move tensors to device efficiently with non_blocking
             return {
                 k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in data.items()
@@ -164,9 +169,12 @@ class DiseaseCoder:
         self, disease_code_lookup, save_path: str = "icd_lookup.pt"
     ) -> Dict[str, Any]:
         """
-        Preprocess ICD lookup into optimized PyTorch format.
+        Preprocess ICD lookup into optimized PyTorch format with normalized embeddings.
         
-        Returns normalized embeddings with metadata for fast lookup.
+        Optimizations:
+        - Vectorized operations where possible
+        - Single-pass parent grouping
+        - Efficient tensor operations
         """
         self.logger.info("Preprocessing ICD lookup into PyTorch format...")
 
@@ -178,45 +186,44 @@ class DiseaseCoder:
         embeddings = F.normalize(embeddings, dim=1)
         self.logger.info(f"Embeddings shape: {embeddings.shape}")
 
-        # Extract metadata (vectorized where possible)
-        metadata_fields = {
-            "icd11Code": "icd11Code",
-            "icd11Title": "icd11Title",
-            "Title_synonym": "Title_synonym",
-            "icd11URI": "icd11URI",
-            "ChapterNo": "ChapterNo",
-            "icd10Code": "icd10Code",
-            "icd10Title": "icd10Title",
-            "snomedCode": "snomedCode",
-            "snomedTitle": "snomedTitle",
-        }
+        # Extract metadata using vectorized operations
+        icd11_codes = [str(c) for c in disease_code_lookup["icd11Code"]]
         
         metadata = {
-            key: [str(c) for c in disease_code_lookup[field]]
-            for key, field in metadata_fields.items()
+            "icd11Code": icd11_codes,
+            "icd11Title": [str(t) for t in disease_code_lookup["icd11Title"]],
+            "Title_synonym": [str(s) for s in disease_code_lookup["Title_synonym"]],
+            "icd11URI": [str(u) for u in disease_code_lookup["icd11URI"]],
+            "ChapterNo": [str(ch) for ch in disease_code_lookup["ChapterNo"]],
+            "icd10Code": [str(c) for c in disease_code_lookup["icd10Code"]],
+            "icd10Title": [str(t) for t in disease_code_lookup["icd10Title"]],
+            "snomedCode": [str(c) for c in disease_code_lookup["snomedCode"]],
+            "snomedTitle": [str(t) for t in disease_code_lookup["snomedTitle"]],
         }
 
-        # Build parent → subcode mapping efficiently
-        icd11_codes = metadata["icd11Code"]
+        # Build parent → subcode mapping efficiently (single pass)
         parent_groups = {}
         for idx, code in enumerate(icd11_codes):
             parent = code.split(".")[0]
             parent_groups.setdefault(parent, []).append(idx)
 
+        # Only keep parents with multiple subcodes
         parent_to_subcodes_keys = []
         parent_to_subcodes_values = []
         for parent, indices in parent_groups.items():
             if len(indices) > 1:
                 parent_to_subcodes_keys.append(parent)
-                parent_to_subcodes_values.append(torch.tensor(indices, dtype=torch.long))
+                parent_to_subcodes_values.append(
+                    torch.tensor(indices, dtype=torch.long)
+                )
 
-        # Create .Z code mask
+        # Create .Z code mask efficiently
         z_code_mask = torch.tensor(
             [c.endswith(".Z") for c in icd11_codes],
             dtype=torch.bool
         )
 
-        # Ensure save path
+        # Ensure save path exists
         save_path = save_path if save_path.endswith(".pt") else f"{save_path}.pt"
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
@@ -232,17 +239,11 @@ class DiseaseCoder:
         torch.save(lookup_dict, save_path)
         self.logger.info(f"ICD lookup saved to {save_path}")
 
-        # Return device-ready dictionary
+        # Return device-ready dictionary with async transfers
         return {
             k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in lookup_dict.items()
         }
-
-    @lru_cache(maxsize=128)
-    def _prepare_single_text_cached(self, text: str) -> Dataset:
-        """Cache single text preparations for repeated calls."""
-        df = pd.DataFrame({self.text_column: [text.strip()]})
-        return Dataset.from_pandas(df)
 
     def _prepare_single_text(self, text: str) -> Dataset:
         """Prepare single text input with validation."""
@@ -251,9 +252,11 @@ class DiseaseCoder:
             self.logger.error(error_msg)
             raise ValueError(error_msg)
         
-        return self._prepare_single_text_cached(text)
+        clean_text = text.strip()
+        df = pd.DataFrame({self.text_column: [clean_text]})
+        return Dataset.from_pandas(df)
 
-    def _prepare_dataset(self) -> tuple[Dataset, Dataset]:
+    def _prepare_dataset(self) -> Tuple[Dataset, Dataset]:
         """Load and validate dataset with caching."""
         if isinstance(self.dataset, Dataset):
             original_data = self.dataset
@@ -268,7 +271,10 @@ class DiseaseCoder:
             dataset=original_data, text_column=self.text_column
         )
         
-        return self.dataset_processor.load_cache(dataset=validated, cache=self.cache)
+        completed_dataset, target_dataset = self.dataset_processor.load_cache(
+            dataset=validated, cache=self.cache
+        )
+        return completed_dataset, target_dataset
 
     def _print_output(self, input_text: str, output_data: Any) -> None:
         """Print formatted output."""
@@ -279,7 +285,11 @@ class DiseaseCoder:
         print(f"[{timestamp} | SUCCESS | PetCoder] Input:  {input_text}")
         print(f"[{timestamp} | SUCCESS | PetCoder] Output:\n{pretty_output}")
 
-    def _run(self, text: Optional[str] = None, dataset: Optional[str] = None) -> Any:
+    def _run(
+        self, 
+        text: Optional[str] = None, 
+        dataset: Optional[str] = None
+    ) -> Optional[Any]:
         """
         Internal method to code text or dataset.
         
@@ -296,15 +306,23 @@ class DiseaseCoder:
         if text and self.dataset:
             raise ValueError("Provide either text or dataset, not both.")
         
-        # Prepare input
+        # Process single text
         if text:
             self.logger.warning("Coding single text. Use dataset for bulk processing.")
             target_dataset = self._prepare_single_text(text)
             result = self.model_processor.single_predict(dataset=target_dataset)
-            self._print_output(text, result[0])
-            return result[0]
+            
+            # Extract the first row's output
+            output = {
+                "disease_extraction": result["Code"][0],
+                "pathogen_extraction": result["pathogen_extraction"][0],
+                "symptom_extraction": result["symptom_extraction"][0],
+            }
+            
+            self._print_output(text, output)
+            return output
         
-        # Dataset processing
+        # Process dataset
         if dataset:
             self.dataset = dataset
         
@@ -323,7 +341,9 @@ class DiseaseCoder:
         return None
 
     def predict(
-        self, text: Optional[str] = None, dataset: Optional[str] = None
+        self, 
+        text: Optional[str] = None, 
+        dataset: Optional[str] = None
     ) -> Optional[Any]:
         """
         Predict on provided text or dataset.
@@ -333,7 +353,7 @@ class DiseaseCoder:
             dataset: Path to dataset file
             
         Returns:
-            Coded output for text, None for dataset operations
+            Dictionary with extractions for text input, None for dataset operations
         """
         if self.num_runs > 1:
             self.logger.warning(
@@ -351,8 +371,7 @@ class DiseaseCoder:
             self.logger.warning("No text or dataset provided.")
             return None
 
-    @torch.inference_mode()
-    def predict_batch(self, texts: list[str]) -> list[Any]:
+    def predict_batch(self, texts: list) -> list:
         """
         Efficiently predict on multiple texts at once.
         
@@ -360,7 +379,7 @@ class DiseaseCoder:
             texts: List of text strings to code
             
         Returns:
-            List of coded outputs
+            List of dictionaries containing extractions for each text
         """
         if not texts:
             self.logger.warning("Empty text list provided.")
@@ -370,13 +389,16 @@ class DiseaseCoder:
         df = pd.DataFrame({self.text_column: texts})
         temp_dataset = Dataset.from_pandas(df)
         
-        # Process in batches
-        results = self.model_processor.predict(dataset=temp_dataset)
+        # Process in batches through ModelProcessor
+        processed = self.model_processor.predict(dataset=temp_dataset)
+        
+        # Extract results for each text
+        results = []
+        for i in range(len(texts)):
+            results.append({
+                "disease_extraction": processed["disease_extraction"][i],
+                "pathogen_extraction": processed["pathogen_extraction"][i],
+                "symptom_extraction": processed["symptom_extraction"][i],
+            })
+        
         return results
-    
-if __name__ == "__main__":
-    # Example usage
-    coder = DiseaseCoder()
-
-    text = "Cookie present with vomiting and diarrhea. Suspected gastroenteritis."
-    coder.predict(text.upper())

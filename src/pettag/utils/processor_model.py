@@ -8,11 +8,13 @@ from datasets import Dataset
 
 
 class ModelProcessor:
+    """Handles NER extraction and disease coding with optimized batch processing."""
+    
     def __init__(
         self,
         framework,
         model,
-        icd_embedding="icd_lookup.pt",  # new default filename
+        icd_embedding=None,
         replaced=True,
         text_column="text",
         label_column="ICD_11_code",
@@ -20,19 +22,25 @@ class ModelProcessor:
         device=None,
         batch_size=256,
     ):
+        from pettag.utils.logging_setup import get_logger
+        from tqdm.contrib.logging import logging_redirect_tqdm
+        
         self.model = model
         self.replaced = replaced
         self.text_column = text_column
         self.label_column = label_column
         self.embedding_model = embedding_model
-        self.device = (
-            device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
         self.framework = framework
         self.logger = get_logger()
-        if self.framework is not None:
-            self.lookup_embeddings = icd_embedding["lookup_embeddings"].to(self.device)
+        
+        # Initialize ICD lookup if framework is specified
+        if self.framework is not None and icd_embedding is not None:
+            # Move embeddings to device with non_blocking for efficiency
+            self.lookup_embeddings = icd_embedding["lookup_embeddings"].to(
+                self.device, non_blocking=True
+            )
             self.icd11_codes = icd_embedding["icd11Code"]
             self.icd11_titles = icd_embedding.get("icd11Title", None)
             self.title_synonyms = icd_embedding.get("Title_synonym", None)
@@ -45,65 +53,63 @@ class ModelProcessor:
 
             self.num_codes = len(self.icd11_codes)
 
+            # Build parent to subcodes mapping
             self.parent_to_subcodes = {
-                k: v.to(self.device)
+                k: v.to(self.device, non_blocking=True)
                 for k, v in zip(
                     icd_embedding["parent_to_subcodes_keys"],
                     icd_embedding["parent_to_subcodes_values"],
                 )
             }
 
-            self.z_code_mask = icd_embedding["z_code_mask"].to(self.device)
+            self.z_code_mask = icd_embedding["z_code_mask"].to(
+                self.device, non_blocking=True
+            )
 
-            # ✅ Pre-compute parent codes for faster matching
+            # Pre-compute parent codes for faster matching (optimization)
             self.code_parents = [code.split(".")[0] for code in self.icd11_codes]
 
-            # ✅ Pre-identify codes starting with "(" for warning optimization
+            # Pre-identify codes with parentheses (for warnings - optional)
             self.codes_with_paren = {
-                i
-                for i, code in enumerate(self.icd11_codes)
+                i for i, code in enumerate(self.icd11_codes)
                 if str(code).strip().startswith("(")
             }
             if self.icd10_codes:
-                self.codes_with_paren.update(
-                    {
-                        i
-                        for i, code in enumerate(self.icd10_codes)
-                        if str(code).strip().startswith("(")
-                    }
-                )
+                self.codes_with_paren.update({
+                    i for i, code in enumerate(self.icd10_codes)
+                    if str(code).strip().startswith("(")
+                })
             if self.snomed_codes:
-                self.codes_with_paren.update(
-                    {
-                        i
-                        for i, code in enumerate(self.snomed_codes)
-                        if str(code).strip().startswith("(")
-                    }
-                )
+                self.codes_with_paren.update({
+                    i for i, code in enumerate(self.snomed_codes)
+                    if str(code).strip().startswith("(")
+                })
 
-            self.logger.info(f"✅ Loaded {self.num_codes} ICD codes on {self.device}.")
+            self.logger.info(f"Loaded {self.num_codes} ICD codes on {self.device}.")
 
-    # -----------------------------------------------------
-    # Internal similarity computation
-    # -----------------------------------------------------
+    @torch.inference_mode()
     def _disease_coder_batch(self, encoded, Z_BOOST):
-        sims = F.linear(encoded, self.lookup_embeddings)  # cosine similarities
+        """Internal optimized similarity computation."""
+        # Compute cosine similarities using efficient matrix multiplication
+        sims = F.linear(encoded, self.lookup_embeddings)
         top_scores, top_idx = sims.max(dim=1)
 
         final_idx = top_idx.clone()
         final_score = top_scores.clone()
 
-        # ✅ Optimized vectorized subcode refinement
+        # Vectorized subcode refinement
         top_idx_cpu = top_idx.cpu().tolist()
         for parent_code, sub_idx in self.parent_to_subcodes.items():
-            # ✅ Use pre-computed parent codes instead of string splitting
+            # Use pre-computed parent codes instead of runtime string splitting
             mask = torch.tensor(
                 [self.code_parents[i] == parent_code for i in top_idx_cpu],
                 dtype=torch.bool,
                 device=self.device,
             )
+            
             if mask.any():
                 sub_sims = sims[mask][:, sub_idx]
+                # Apply Z-code boost
                 sub_sims = sub_sims + (self.z_code_mask[sub_idx] * Z_BOOST)
                 best_sub = sub_sims.argmax(dim=1)
                 final_idx[mask] = sub_idx[best_sub]
@@ -111,28 +117,22 @@ class ModelProcessor:
 
         return final_idx, final_score
 
-    # -----------------------------------------------------
-    # Public disease coding interface
-    # -----------------------------------------------------
     @torch.inference_mode()
     def disease_coder_batch(self, diseases, Z_BOOST=0.06, framework=None):
         """
-        Encode a batch of disease descriptions and return the most similar ICD/SNOMED entries.
+        Encode disease descriptions and return most similar ICD/SNOMED entries.
 
-        Parameters
-        ----------
-        diseases : list[str]
-            A list of free-text disease descriptions to map to codes.
-        Z_BOOST : float, optional
-            A boost applied to ".Z" codes to slightly prioritize terminal classifications.
+        Args:
+            diseases: List of disease descriptions
+            Z_BOOST: Boost for terminal .Z codes
+            framework: Override framework (icd11, icd10, snomed)
 
-        Returns
-        -------
-        list[dict]
-            A list of dictionaries containing framework-specific metadata and similarity scores.
+        Returns:
+            List of dictionaries with coding results
         """
         if not diseases:
             return []
+        
         framework = framework or self.framework
         framework = framework.lower()
         valid_frameworks = ["icd11", "icd10", "snomed"]
@@ -141,29 +141,24 @@ class ModelProcessor:
                 f"Invalid framework '{framework}'. Must be one of {valid_frameworks}."
             )
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 1. Encode input diseases using the embedding model
-        # -------------------------------------------------------------------------
+        # Encode diseases using embedding model
         encoded = self.embedding_model.encode(
             diseases,
             convert_to_tensor=True,
             device=self.device if torch.cuda.is_available() else None,
             batch_size=self.batch_size,
             show_progress_bar=False,
+            normalize_embeddings=True,  # Let the model normalize if supported
         )
-        # ✅ Only normalize if embeddings aren't already normalized
-        # Check your embedding model documentation - many models return normalized vectors
-        encoded = F.normalize(encoded, dim=1)
+        
+        # Ensure normalization (some models may not support normalize_embeddings param)
+        if not hasattr(self.embedding_model, 'normalize_embeddings'):
+            encoded = F.normalize(encoded, dim=1)
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 2. Perform vector similarity search
-        # -------------------------------------------------------------------------
+        # Perform similarity search
         final_idx, final_score = self._disease_coder_batch(encoded, Z_BOOST)
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 3. Compile metadata for top matches according to framework
-        # -------------------------------------------------------------------------
-        # ✅ Move tensors to CPU once and clamp scores
+        # Compile results
         final_idx_cpu = final_idx.cpu().tolist()
         final_score_cpu = torch.clamp(final_score, max=1.0).cpu().tolist()
 
@@ -174,65 +169,51 @@ class ModelProcessor:
 
             if framework == "icd11":
                 code = self.icd11_codes[idx]
-                title = (
-                    self.icd11_titles[idx] if self.icd11_titles is not None else None
-                )
-                chapter = self.chapters[idx] if self.chapters is not None else None
-                uri = self.icd11_uris[idx] if self.icd11_uris is not None else None
-
+                title = self.icd11_titles[idx] if self.icd11_titles else None
+                chapter = self.chapters[idx] if self.chapters else None
+                uri = self.icd11_uris[idx] if self.icd11_uris else None
             elif framework == "icd10":
-                code = self.icd10_codes[idx] if self.icd10_codes is not None else None
-                title = (
-                    self.icd10_titles[idx] if self.icd10_titles is not None else None
-                )
-                chapter = self.chapters[idx] if self.chapters is not None else None
+                code = self.icd10_codes[idx] if self.icd10_codes else None
+                title = self.icd10_titles[idx] if self.icd10_titles else None
+                chapter = self.chapters[idx] if self.chapters else None
                 uri = ""
-
             elif framework == "snomed":
-                code = self.snomed_codes[idx] if self.snomed_codes is not None else None
-                title = (
-                    self.snomed_titles[idx] if self.snomed_titles is not None else None
-                )
+                code = self.snomed_codes[idx] if self.snomed_codes else None
+                title = self.snomed_titles[idx] if self.snomed_titles else None
                 chapter = ""
                 uri = ""
 
-            # if idx in self.codes_with_paren:
-            #     self.logger.warning(
-            #         f"⚠️ The matched {framework} code '{code}' is an ICD-11 code."
-            #     )
-
-            results.append(
-                {
-                    "Input Disease": disease,
-                    "Framework": framework.upper(),
-                    "Code": code,
-                    "Title": title,
-                    "Chapter": chapter,
-                    "URI": (
-                        f"https://icd.who.int/browse/2025-01/mms/en#{uri}"
-                        if uri
-                        else None
-                    ),
-                    "Similarity": score,
-                }
-            )
+            results.append({
+                "Input Disease": disease,
+                "Framework": framework.upper(),
+                "Code": code,
+                "Title": title,
+                "Chapter": chapter,
+                "URI": f"https://icd.who.int/browse/2025-01/mms/en#{uri}" if uri else None,
+                "Similarity": score,
+            })
 
         return results
 
     def disease_coder(self, disease, Z_BOOST=0.06):
+        """Code a single disease."""
         return self.disease_coder_batch([disease], Z_BOOST)[0]
 
-    # -----------------------------------------------------
-    # NER and batch processing
-    # -----------------------------------------------------
     def _process_batch(self, examples):
-        # ✅ Only lowercase if your NER model requires it
+        """Process batch with NER and disease coding."""
+        from tqdm.contrib.logging import logging_redirect_tqdm
+        
+        # Lowercase if your NER model requires it
         texts = [t.lower() for t in examples[self.text_column]]
+        
+        # Run NER
         ner_results = self.model(texts)
+        
         all_diseases = []
         disease_spans = []
         batch_symptoms, batch_pathogens = [], []
 
+        # Extract entities
         for doc in ner_results:
             diseases, symptoms, pathogens = set(), set(), set()
             for ent in doc:
@@ -251,12 +232,11 @@ class ModelProcessor:
             batch_symptoms.append(list(symptoms))
             batch_pathogens.append(list(pathogens))
 
-        # -------------------------------------------------
-        # ✅ If framework=None, skip ICD/SNOMED coding
-        # -------------------------------------------------
+        # Code diseases if framework is specified
         if self.framework is None:
             batch_diseases = [
-                [{"Entity": d} for d in all_diseases[s:e]] for s, e in disease_spans
+                [{"Entity": d} for d in all_diseases[s:e]] 
+                for s, e in disease_spans
             ]
         else:
             if all_diseases:
@@ -271,8 +251,10 @@ class ModelProcessor:
             "symptom_extraction": batch_symptoms,
         }
 
-    # -----------------------------------------------------
     def predict(self, dataset):
+        """Predict on entire dataset with progress bar."""
+        from tqdm.contrib.logging import logging_redirect_tqdm
+        
         date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         with logging_redirect_tqdm():
             processed_dataset = dataset.map(
@@ -285,14 +267,13 @@ class ModelProcessor:
         return processed_dataset
 
     def single_predict(self, dataset):
+        """Predict on single text example."""
         dataset = dataset.select([0])
         processed = self._process_batch(examples=dataset)
-        return Dataset.from_dict(
-            {
-                self.text_column: dataset[self.text_column],
-                "Code": processed["disease_extraction"],
-                "pathogen_extraction": processed["pathogen_extraction"],
-                "symptom_extraction": processed["symptom_extraction"],
-                # self.label_column: processed[self.label_column],
-            }
-        )
+        
+        return Dataset.from_dict({
+            self.text_column: dataset[self.text_column],
+            "Code": processed["disease_extraction"],
+            "pathogen_extraction": processed["pathogen_extraction"],
+            "symptom_extraction": processed["symptom_extraction"],
+        })
