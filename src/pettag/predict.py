@@ -331,7 +331,6 @@ class DiseaseCoder:
         self.dataset_processor.save_dataset_file(
             target_dataset=processed,
             completed_dataset=completed_dataset,
-            cache=self.cache,
             output_dir=self.output_dir,
         )
         return None
