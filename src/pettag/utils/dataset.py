@@ -110,62 +110,75 @@ class DatasetProcessor:
             self.logger.error(error_message)
             raise ValueError(error_message)
 
-    def load_cache(self, dataset, cache_column="label") -> tuple:
+    def load_cache(self, dataset: Dataset, cache_column: str = "label") -> tuple[Dataset, Dataset | None]:
         """
-        Filter out anonymised data from the dataset using a cache.
+        Filters a dataset into 'target' (uncompleted) and 'completed' (cached) sets.
+
+        It assumes a non-empty string in the `cache_column` indicates a completed row.
 
         Args:
-            dataset: The dataset to filter.
-            cache (bool | str): If True, removes examples where "annonymised" == 1.
-                                If str, treats it as a column name and filters out rows
-                                based on cached record IDs from a text file.
-            cache_path (str): Path to cache directory (only used if `cache` is a str).
+            dataset: The dataset to filter (e.g., Hugging Face Dataset).
+            cache_column (str): The column used to determine cache status.
+                                A non-empty string means the row is 'completed'.
 
         Returns:
-            tuple: (filtered_dataset, original_dataset)
+            tuple[Dataset, Dataset | None]: (target_dataset, completed_dataset)
         """
+        # 1. Check if caching is enabled (assuming 'self.cache' holds the boolean flag)
+        if not self.cache:
+            self.logger.info("Cache disabled | Processing all data")
+            return dataset, None
+
         target_dataset = dataset
         completed_dataset = None
-        if cache:
-            try:
-                # If the goal is: Non-empty string means "completed"
-                completed_dataset = dataset.filter(
-                    lambda example: example.get(label_column, "")
-                    != ""  # Use "" as a safe default
-                )
 
-                # Target: The column is an empty string (not completed)
-                target_dataset = dataset.filter(
-                    lambda example: example.get(label_column, "")
-                    == ""  # Use "" as a safe default
-                )
-                self.logger.info(
-                    f"Cache enabled | Skipping {len(completed_dataset)} Coded rows | Processing {len(target_dataset)} rows"
-                )
-
-            except Exception as e:
-                self.logger.error(f"Failed to apply cache filtering: {e}")
-
-            if not target_dataset:
-                self.logger.info("All data appears to have been Coded. Exiting...")
-                self.logger.warning(
-                    "If this was unexpected, please check your cache file or delete a column called 'annonymised' in your dataset."
-                )
-                import sys
-
-                sys.exit(0)
-            else:
-                self.logger.info(f"Processing {len(target_dataset)} non-Coded rows")
-                return (
-                    target_dataset,
-                    completed_dataset,
-                )
-        else:
-            self.logger.info("Cache disabled | Processing all data")
-            return (
-                target_dataset,
-                completed_dataset,
+        try:
+            # A. Filter for the 'target' dataset (rows to be processed/uncached)
+            # Condition: The cache_column is an empty string (not completed)
+            target_dataset = dataset.filter(
+                lambda example: example.get(cache_column, "") == "",
+                # Use 'desc' for better logging in large-scale operations
+                desc=f"Filtering uncompleted rows based on '{cache_column}'"
             )
+
+            # B. Determine the 'completed' dataset by filtering for the opposite condition
+            # This is more efficient than filtering the original dataset again.
+            # Condition: The cache_column is a non-empty string (completed)
+            completed_dataset = dataset.filter(
+                lambda example: example.get(cache_column, "") != "",
+                desc=f"Filtering completed rows based on '{cache_column}'"
+            )
+            
+            target_count = len(target_dataset)
+            completed_count = len(completed_dataset)
+            self.logger.info(
+                f"Cache enabled | Skipping {completed_count:,} Completed rows | Processing {target_count:,} Target rows"
+            )
+
+            # 2. Handle the case where all data is completed
+            if target_count == 0:
+                self.logger.info("All data appears to have been Coded/Cached. Exiting filter...")
+                self.logger.warning(
+                    f"If unexpected, please check/delete the content of the column '{cache_column}'."
+                )
+                # Do not call sys.exit(), simply return the result
+                return target_dataset, completed_dataset
+
+        except KeyError as e:
+            self.logger.error(f"Failed to apply cache filtering: Column '{cache_column}' not found in dataset. Error: {e}")
+            # Log a warning and proceed with the full dataset if column is missing
+            self.logger.warning("Cache filtering aborted. Returning full dataset as target.")
+            target_dataset = dataset
+            completed_dataset = None
+        except Exception as e:
+            # Catch other unexpected errors and log the traceback
+            self.logger.error(f"An unexpected error occurred during cache filtering: {e}", exc_info=True)
+            self.logger.warning("Cache filtering aborted. Returning full dataset as target.")
+            target_dataset = dataset
+            completed_dataset = None
+
+        # 3. Single return point for clarity
+    return target_dataset, completed_dataset
 
     def save_dataset_file(
         self,

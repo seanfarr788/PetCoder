@@ -268,7 +268,7 @@ class DiseaseCoder:
             dataset=original_data, text_column=self.text_column
         )
         completed_dataset, target_dataset = self.dataset_processor.load_cache(
-            dataset=validated, cache=self.cache, cache_column=self.label_column
+            dataset=validated, cache_column=self.label_column
         )
         return completed_dataset, target_dataset
 
