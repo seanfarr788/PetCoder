@@ -4,6 +4,7 @@ import pandas as pd
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from pettag.utils.logging_setup import get_logger
 from typing import Dict, Any, Optional
+import os
 import datetime
 
 
@@ -11,7 +12,7 @@ class DatasetProcessor:
     def __init__(
         self,
         cache: bool = True,
-    ):  
+    ):
         self.cache = cache
         self.logger = logging.getLogger(__name__)
         self._last_input_format = None  # Initialize
@@ -158,7 +159,7 @@ class DatasetProcessor:
             target_count = len(target_dataset)
             completed_count = len(completed_dataset)
             self.logger.info(
-                f"Cache enabled | Skipping {completed_count:,} Completed rows | Processing {target_count:,} Target rows"
+                f"Cache enabled | Skipping {completed_count} Completed rows | Processing {target_count} Target rows"
             )
 
             # 2. Handle the case where all data is completed
@@ -172,16 +173,6 @@ class DatasetProcessor:
                 # Do not call sys.exit(), simply return the result
                 return target_dataset, completed_dataset
 
-        except KeyError as e:
-            self.logger.error(
-                f"Failed to apply cache filtering: Column '{cache_column}' not found in dataset. Error: {e}"
-            )
-            # Log a warning and proceed with the full dataset if column is missing
-            self.logger.warning(
-                "Cache filtering aborted. Returning full dataset as target."
-            )
-            target_dataset = dataset
-            completed_dataset = None
         except Exception as e:
             # Catch other unexpected errors and log the traceback
             self.logger.error(
