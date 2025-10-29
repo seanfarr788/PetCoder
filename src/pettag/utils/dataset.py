@@ -137,7 +137,7 @@ class DatasetProcessor:
                 target_dataset = dataset.filter(
                     lambda example: example.get(label_column, "") == "" # Use "" as a safe default
                 )
-                else:
+                else 
                     raise ValueError(
                         "`cache` must be either a boolean."
                     )
