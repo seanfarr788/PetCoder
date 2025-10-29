@@ -10,7 +10,9 @@ import datetime
 class DatasetProcessor:
     def __init__(
         self,
-    ):
+        cache: bool = True,
+    ):  
+        self.cache = cache
         self.logger = logging.getLogger(__name__)
         self._last_input_format = None  # Initialize
 

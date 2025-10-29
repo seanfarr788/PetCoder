@@ -77,7 +77,7 @@ class DiseaseCoder:
         self.logger = self._setup_logger()
         
         # Dataset processor
-        self.dataset_processor = DatasetProcessor()
+        self.dataset_processor = DatasetProcessor(cache=self.cache)
         
         # Model initialization with optimizations
         self.logger.info(f"Initializing NER pipeline on {self.device}")
