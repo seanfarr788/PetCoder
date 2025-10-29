@@ -2,8 +2,8 @@ import os
 import logging
 import pandas as pd
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from pettag.utils.logging_setup import get_logger
 from typing import Dict, Any, Optional
-import os
 import datetime
 
 
@@ -15,6 +15,7 @@ class DatasetProcessor:
         self.cache = cache
         self.logger = logging.getLogger(__name__)
         self._last_input_format = None  # Initialize
+        self.logger = get_logger()
 
     def validate_dataset(self, dataset, text_column) -> None:
         if text_column not in dataset.column_names:
@@ -137,12 +138,13 @@ class DatasetProcessor:
         completed_dataset = None
 
         try:
+            timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
             # A. Filter for the 'target' dataset (rows to be processed/uncached)
             # Condition: The cache_column is an empty string (not completed)
             target_dataset = dataset.filter(
                 lambda example: example.get(cache_column, "") == "",
                 # Use 'desc' for better logging in large-scale operations
-                desc=f"Filtering uncompleted rows based on '{cache_column}'",
+                desc=f"[{timestamp} | SUCCESS | PetCoder] Filtering uncompleted rows based on '{cache_column}'",
             )
 
             # B. Determine the 'completed' dataset by filtering for the opposite condition
@@ -150,7 +152,7 @@ class DatasetProcessor:
             # Condition: The cache_column is a non-empty string (completed)
             completed_dataset = dataset.filter(
                 lambda example: example.get(cache_column, "") != "",
-                desc=f"Filtering completed rows based on '{cache_column}'",
+                desc=f"[{timestamp} | SUCCESS | PetCoder] Filtering completed rows based on '{cache_column}'",
             )
 
             target_count = len(target_dataset)
