@@ -251,19 +251,51 @@ class ModelProcessor:
             "symptom_extraction": batch_symptoms,
         }
 
-    def predict(self, dataset):
-        """Predict on entire dataset with progress bar."""
-        from tqdm.contrib.logging import logging_redirect_tqdm
-        
+    def predict(self, dataset, cache_dir, ):
+        """Predict on entire dataset with checkpointing and progress bar."""
         date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        cache_dir = "./cache_predictions"
+        os.makedirs(cache_dir, exist_ok=True)
+        chunk_size = 50_000
+
+        total_records = len(dataset)
+        num_chunks = (total_records + chunk_size - 1) // chunk_size
+        processed_chunks = []
+
+        self.logger.info(f"Starting prediction over {total_records} records in {num_chunks} chunks...")
+
         with logging_redirect_tqdm():
-            processed_dataset = dataset.map(
-                self._process_batch,
-                batched=True,
-                batch_size=self.batch_size,
-                desc=f"[{date_time} |   INFO  | PetCoder]",
-                load_from_cache_file=False,
-            )
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, total_records)
+                chunk_path = os.path.join(cache_dir, f"chunk_{i}.arrow")
+
+                # Skip if checkpoint exists
+                if os.path.exists(chunk_path):
+                    self.logger.info(f"Found checkpoint for chunk {i+1}/{num_chunks}, skipping...")
+                    processed_chunk = Dataset.from_file(chunk_path)
+                else:
+                    self.logger.info(f"Processing chunk {i+1}/{num_chunks} ({start_idx}:{end_idx})...")
+                    subset = dataset.select(range(start_idx, end_idx))
+                    processed_chunk = subset.map(
+                        self._process_batch,
+                        batched=True,
+                        batch_size=self.batch_size,
+                        desc=f"[{date_time} |   INFO  | PetCoder | Chunk {i+1}/{num_chunks}]",
+                        load_from_cache_file=False,
+                    )
+                    processed_chunk.save_to_disk(chunk_path)
+
+                processed_chunks.append(processed_chunk)
+
+        # Concatenate all processed chunks
+        self.logger.info("Concatenating {len(processed_chunks)} chunks...")
+        processed_dataset = concatenate_datasets(processed_chunks)
+
+        # Cleanup cache
+        shutil.rmtree(cache_dir)
+        self.logger.info(" All chunks combined. Cache cleared.")
+
         return processed_dataset
 
     def single_predict(self, dataset):

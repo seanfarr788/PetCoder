@@ -148,12 +148,15 @@ class DatasetProcessor:
             )
 
             # B. Determine the 'completed' dataset by filtering for the opposite condition
-            # This is more efficient than filtering the original dataset again.
-            # Condition: The cache_column is a non-empty string (completed)
-            completed_dataset = dataset.filter(
-                lambda example: example.get(cache_column) not in ["", None],
-                desc=f"[{timestamp} |  INFO  | PetCoder] Filtering completed rows based on '{cache_column}'",
-            )
+            # if len(target_dataset) < len(dataset):
+            if len(dataset) - len(target_dataset) > 0:
+                completed_dataset = dataset.filter(
+                    lambda example: example.get(cache_column) not in ["", None],
+                    desc=f"[{timestamp} |  INFO  | PetCoder] Filtering completed rows based on '{cache_column}'",
+                )
+            else:
+                completed_dataset = None
+
 
             target_count = len(target_dataset)
             completed_count = len(completed_dataset)

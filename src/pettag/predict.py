@@ -331,7 +331,7 @@ class DiseaseCoder:
 
             self._print_output(text, output)
             return output
-
+        
         # Process dataset
         if dataset:
             self.dataset = dataset
