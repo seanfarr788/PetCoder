@@ -10,9 +10,7 @@ import datetime
 class DatasetProcessor:
     def __init__(
         self,
-        cache_path: str = "petharbor_cache/",
     ):
-        self.cache_path = cache_path
         self.logger = logging.getLogger(__name__)
         self._last_input_format = None  # Initialize
 
@@ -112,7 +110,7 @@ class DatasetProcessor:
             self.logger.error(error_message)
             raise ValueError(error_message)
 
-    def load_cache(self, dataset, cache=False) -> tuple:
+    def load_cache(self, dataset, cache_column='label') -> tuple:
         """
         Filter out anonymised data from the dataset using a cache.
 
@@ -130,52 +128,18 @@ class DatasetProcessor:
         completed_dataset = None
         if cache:
             try:
-                if isinstance(cache, bool):
-                    target_dataset = dataset.filter(
-                        lambda example: example.get("annonymised", 0) == 0
-                    )
+                # If the goal is: Non-empty string means "completed"
+                completed_dataset = dataset.filter(
+                    lambda example: example.get(label_column, "") != "" # Use "" as a safe default
+                )
 
-                    completed_dataset = dataset.filter(
-                        lambda example: example.get("annonymised", 0) == 1
-                    )
-
-                elif isinstance(cache, str):
-                    if cache not in dataset.column_names:
-                        self.logger.error(f"Column '{cache}' not found in dataset.")
-                        raise ValueError(f"Column '{cache}' not found in dataset.")
-
-                    self.full_cache_path = os.path.join(
-                        self.cache_path, f"{cache}_cache.txt"
-                    )
-                    if os.path.exists(self.full_cache_path):
-                        with open(self.full_cache_path, "r") as f:
-                            cached_ids = set(line.strip() for line in f)
-                        target_dataset = dataset.filter(
-                            lambda example: str(example[cache]) not in cached_ids
-                        )
-
-                        completed_dataset = dataset.filter(
-                            lambda example: str(example[cache]) in cached_ids
-                        )
-                    else:
-                        # Create the cache file if it doesn't exist
-                        # create the directory if it doesn't exist
-                        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
-                        self.cache_path = os.path.join(
-                            self.cache_path, f"{cache}_cache.txt"
-                        )
-                        with open(self.full_cache_path, "w") as f:
-                            f.write("")
-
-                        self.logger.info(
-                            f"Cache file '{self.cache_path}' created. No cached IDs found."
-                        )
-                        target_dataset = dataset
-                        completed_dataset = None
-
+                # Target: The column is an empty string (not completed)
+                target_dataset = dataset.filter(
+                    lambda example: example.get(label_column, "") == "" # Use "" as a safe default
+                )
                 else:
                     raise ValueError(
-                        "`cache` must be either a boolean or a string (column name)."
+                        "`cache` must be either a boolean."
                     )
 
                 self.logger.info(

@@ -32,7 +32,6 @@ class DiseaseCoder:
         text_column (str): Column containing text. Defaults to 'text'.
         label_column (str): Column containing labels. Defaults to 'labels'.
         cache (bool): Whether to use caching. Defaults to True.
-        cache_path (str): Cache directory. Defaults to 'petharbor_cache/'.
         logs (str, optional): Path to save logs.
         device (str, optional): Computation device. Auto-detected if None.
         output_dir (str, optional): Output directory for results.
@@ -52,7 +51,6 @@ class DiseaseCoder:
         text_column: str = "text",
         label_column: str = "labels",
         cache: bool = True,
-        cache_path: str = "petharbor_cache/",
         logs: Optional[str] = None,
         device: Optional[str] = None,
         output_dir: Optional[str] = None,
@@ -65,7 +63,6 @@ class DiseaseCoder:
         self.label_column = label_column
         self.batch_size = batch_size
         self.cache = cache
-        self.cache_path = cache_path
         self.logs = logs
         self.output_dir = output_dir
         self.num_runs = 0
@@ -80,7 +77,7 @@ class DiseaseCoder:
         self.logger = self._setup_logger()
         
         # Dataset processor
-        self.dataset_processor = DatasetProcessor(cache_path=self.cache_path)
+        self.dataset_processor = DatasetProcessor()
         
         # Model initialization with optimizations
         self.logger.info(f"Initializing NER pipeline on {self.device}")
@@ -270,9 +267,8 @@ class DiseaseCoder:
         validated = self.dataset_processor.validate_dataset(
             dataset=original_data, text_column=self.text_column
         )
-        
         completed_dataset, target_dataset = self.dataset_processor.load_cache(
-            dataset=validated, cache=self.cache
+            dataset=validated, cache=self.cache, cache_column=self.label_column
         )
         return completed_dataset, target_dataset
 
@@ -340,37 +336,6 @@ class DiseaseCoder:
         )
         return None
 
-    def predict(
-        self, 
-        text: Optional[str] = None, 
-        dataset: Optional[str] = None
-    ) -> Optional[Any]:
-        """
-        Predict on provided text or dataset.
-        
-        Args:
-            text: Single text string to code
-            dataset: Path to dataset file
-            
-        Returns:
-            Dictionary with extractions for text input, None for dataset operations
-        """
-        if self.num_runs > 1:
-            self.logger.warning(
-                "Sequential model runs detected. Consider passing 'dataset' to class init."
-            )
-
-        dataset = dataset or self.dataset
-        
-        if text is not None:
-            return self._run(text=text, dataset=None)
-        elif dataset is not None:
-            self._run(text=None, dataset=dataset)
-            return None
-        else:
-            self.logger.warning("No text or dataset provided.")
-            return None
-
     def predict_batch(self, texts: list) -> list:
         """
         Efficiently predict on multiple texts at once.
@@ -402,3 +367,37 @@ class DiseaseCoder:
             })
         
         return results
+    
+    #################################################################################
+               
+    def predict(
+        self, 
+        text: Optional[str] = None, 
+        dataset: Optional[str] = None
+    ) -> Optional[Any]:
+        """
+        Predict on provided text or dataset.
+        
+        Args:
+            text: Single text string to code
+            dataset: Path to dataset file
+            
+        Returns:
+            Dictionary with extractions for text input, None for dataset operations
+        """
+        if self.num_runs > 1:
+            self.logger.warning(
+                "Sequential model runs detected. Consider passing 'dataset' to class init."
+            )
+
+        dataset = dataset or self.dataset
+        
+        if text is not None:
+            return self._run(text=text, dataset=None)
+        elif dataset is not None:
+            self._run(text=None, dataset=dataset)
+            return None
+        else:
+            self.logger.warning("No text or dataset provided.")
+            return None
+
