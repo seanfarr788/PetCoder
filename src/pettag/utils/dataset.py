@@ -178,7 +178,7 @@ class DatasetProcessor:
             completed_dataset = None
 
         # 3. Single return point for clarity
-    return target_dataset, completed_dataset
+        return target_dataset, completed_dataset
 
     def save_dataset_file(
         self,
