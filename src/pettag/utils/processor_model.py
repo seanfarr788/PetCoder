@@ -4,12 +4,14 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from torch.nn import functional as F
 import pandas as pd
 import numpy as np
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
+import os
+import shutil
 
 
 class ModelProcessor:
     """Handles NER extraction and disease coding with optimized batch processing."""
-    
+
     def __init__(
         self,
         framework,
@@ -24,17 +26,19 @@ class ModelProcessor:
     ):
         from pettag.utils.logging_setup import get_logger
         from tqdm.contrib.logging import logging_redirect_tqdm
-        
+
         self.model = model
         self.replaced = replaced
         self.text_column = text_column
         self.label_column = label_column
         self.embedding_model = embedding_model
-        self.device = device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = (
+            device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        )
         self.batch_size = batch_size
         self.framework = framework
         self.logger = get_logger()
-        
+
         # Initialize ICD lookup if framework is specified
         if self.framework is not None and icd_embedding is not None:
             # Move embeddings to device with non_blocking for efficiency
@@ -71,19 +75,26 @@ class ModelProcessor:
 
             # Pre-identify codes with parentheses (for warnings - optional)
             self.codes_with_paren = {
-                i for i, code in enumerate(self.icd11_codes)
+                i
+                for i, code in enumerate(self.icd11_codes)
                 if str(code).strip().startswith("(")
             }
             if self.icd10_codes:
-                self.codes_with_paren.update({
-                    i for i, code in enumerate(self.icd10_codes)
-                    if str(code).strip().startswith("(")
-                })
+                self.codes_with_paren.update(
+                    {
+                        i
+                        for i, code in enumerate(self.icd10_codes)
+                        if str(code).strip().startswith("(")
+                    }
+                )
             if self.snomed_codes:
-                self.codes_with_paren.update({
-                    i for i, code in enumerate(self.snomed_codes)
-                    if str(code).strip().startswith("(")
-                })
+                self.codes_with_paren.update(
+                    {
+                        i
+                        for i, code in enumerate(self.snomed_codes)
+                        if str(code).strip().startswith("(")
+                    }
+                )
 
             self.logger.info(f"Loaded {self.num_codes} ICD codes on {self.device}.")
 
@@ -106,7 +117,7 @@ class ModelProcessor:
                 dtype=torch.bool,
                 device=self.device,
             )
-            
+
             if mask.any():
                 sub_sims = sims[mask][:, sub_idx]
                 # Apply Z-code boost
@@ -132,7 +143,7 @@ class ModelProcessor:
         """
         if not diseases:
             return []
-        
+
         framework = framework or self.framework
         framework = framework.lower()
         valid_frameworks = ["icd11", "icd10", "snomed"]
@@ -150,9 +161,9 @@ class ModelProcessor:
             show_progress_bar=False,
             normalize_embeddings=True,  # Let the model normalize if supported
         )
-        
+
         # Ensure normalization (some models may not support normalize_embeddings param)
-        if not hasattr(self.embedding_model, 'normalize_embeddings'):
+        if not hasattr(self.embedding_model, "normalize_embeddings"):
             encoded = F.normalize(encoded, dim=1)
 
         # Perform similarity search
@@ -183,15 +194,21 @@ class ModelProcessor:
                 chapter = ""
                 uri = ""
 
-            results.append({
-                "Input Disease": disease,
-                "Framework": framework.upper(),
-                "Code": code,
-                "Title": title,
-                "Chapter": chapter,
-                "URI": f"https://icd.who.int/browse/2025-01/mms/en#{uri}" if uri else None,
-                "Similarity": score,
-            })
+            results.append(
+                {
+                    "Input Disease": disease,
+                    "Framework": framework.upper(),
+                    "Code": code,
+                    "Title": title,
+                    "Chapter": chapter,
+                    "URI": (
+                        f"https://icd.who.int/browse/2025-01/mms/en#{uri}"
+                        if uri
+                        else None
+                    ),
+                    "Similarity": score,
+                }
+            )
 
         return results
 
@@ -202,13 +219,13 @@ class ModelProcessor:
     def _process_batch(self, examples):
         """Process batch with NER and disease coding."""
         from tqdm.contrib.logging import logging_redirect_tqdm
-        
+
         # Lowercase if your NER model requires it
         texts = [t.lower() for t in examples[self.text_column]]
-        
+
         # Run NER
         ner_results = self.model(texts)
-        
+
         all_diseases = []
         disease_spans = []
         batch_symptoms, batch_pathogens = [], []
@@ -235,8 +252,7 @@ class ModelProcessor:
         # Code diseases if framework is specified
         if self.framework is None:
             batch_diseases = [
-                [{"Entity": d} for d in all_diseases[s:e]] 
-                for s, e in disease_spans
+                [{"Entity": d} for d in all_diseases[s:e]] for s, e in disease_spans
             ]
         else:
             if all_diseases:
@@ -251,18 +267,28 @@ class ModelProcessor:
             "symptom_extraction": batch_symptoms,
         }
 
-    def predict(self, dataset, cache_dir, ):
+    def predict(
+        self,
+        dataset,
+        cache_dir="./cache_predictions",
+    ):
         """Predict on entire dataset with checkpointing and progress bar."""
         date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        cache_dir = "./cache_predictions"
         os.makedirs(cache_dir, exist_ok=True)
         chunk_size = 50_000
 
         total_records = len(dataset)
+        if total_records > chunk_size:
+            self.logger.info(
+                f"Large Dataset detected (n={total_records:,}) | processing in {chunk_size:,}  ."
+            )
+        self.logger.info(f"Total records to process: {total_records} | ")
         num_chunks = (total_records + chunk_size - 1) // chunk_size
         processed_chunks = []
 
-        self.logger.info(f"Starting prediction over {total_records} records in {num_chunks} chunks...")
+        self.logger.info(
+            f"Starting prediction over {total_records:,} records in {num_chunks} chunks..."
+        )
 
         with logging_redirect_tqdm():
             for i in range(num_chunks):
@@ -272,15 +298,20 @@ class ModelProcessor:
 
                 # Skip if checkpoint exists
                 if os.path.exists(chunk_path):
-                    self.logger.info(f"Found checkpoint for chunk {i+1}/{num_chunks}, skipping...")
+                    self.logger.info(
+                        f"Found checkpoint for chunk {i+1}/{num_chunks}, skipping..."
+                    )
                     processed_chunk = Dataset.from_file(chunk_path)
                 else:
-                    self.logger.info(f"Processing chunk {i+1}/{num_chunks} ({start_idx}:{end_idx})...")
+                    self.logger.info(
+                        f"Processing chunk {i+1}/{num_chunks} ({start_idx}:{end_idx})..."
+                    )
                     subset = dataset.select(range(start_idx, end_idx))
                     processed_chunk = subset.map(
                         self._process_batch,
                         batched=True,
                         batch_size=self.batch_size,
+                        num_proc=4,
                         desc=f"[{date_time} |   INFO  | PetCoder | Chunk {i+1}/{num_chunks}]",
                         load_from_cache_file=False,
                     )
@@ -302,10 +333,12 @@ class ModelProcessor:
         """Predict on single text example."""
         dataset = dataset.select([0])
         processed = self._process_batch(examples=dataset)
-        
-        return Dataset.from_dict({
-            self.text_column: dataset[self.text_column],
-            "Code": processed["disease_extraction"],
-            "pathogen_extraction": processed["pathogen_extraction"],
-            "symptom_extraction": processed["symptom_extraction"],
-        })
+
+        return Dataset.from_dict(
+            {
+                self.text_column: dataset[self.text_column],
+                "Code": processed["disease_extraction"],
+                "pathogen_extraction": processed["pathogen_extraction"],
+                "symptom_extraction": processed["symptom_extraction"],
+            }
+        )
