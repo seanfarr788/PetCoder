@@ -267,6 +267,10 @@ class DiseaseCoder:
         validated = self.dataset_processor.validate_dataset(
             dataset=original_data, text_column=self.text_column
         )
+        # if self.label_column not in validated.column_names add it
+        if self.label_column not in validated.column_names:
+            validated = validated.add_column(self.label_column, [[] for _ in range(len(validated))])
+        
         completed_dataset, target_dataset = self.dataset_processor.load_cache(
             dataset=validated, cache_column=self.label_column
         )
