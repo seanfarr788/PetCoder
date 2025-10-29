@@ -52,6 +52,26 @@ class ModelProcessor:
         }
 
         self.z_code_mask = icd_embedding["z_code_mask"].to(self.device)
+        
+        # ✅ Pre-compute parent codes for faster matching
+        self.code_parents = [code.split(".")[0] for code in self.icd11_codes]
+        
+        # ✅ Pre-identify codes starting with "(" for warning optimization
+        self.codes_with_paren = {
+            i for i, code in enumerate(self.icd11_codes) 
+            if str(code).strip().startswith("(")
+        }
+        if self.icd10_codes:
+            self.codes_with_paren.update({
+                i for i, code in enumerate(self.icd10_codes) 
+                if str(code).strip().startswith("(")
+            })
+        if self.snomed_codes:
+            self.codes_with_paren.update({
+                i for i, code in enumerate(self.snomed_codes) 
+                if str(code).strip().startswith("(")
+            })
+        
         self.logger.info(f"✅ Loaded {self.num_codes} ICD codes on {self.device}.")
 
     # -----------------------------------------------------
@@ -64,10 +84,13 @@ class ModelProcessor:
         final_idx = top_idx.clone()
         final_score = top_scores.clone()
 
-        # Vectorized subcode refinement
+        # ✅ Optimized vectorized subcode refinement
+        top_idx_cpu = top_idx.cpu().tolist()
         for parent_code, sub_idx in self.parent_to_subcodes.items():
+            # ✅ Use pre-computed parent codes instead of string splitting
             mask = torch.tensor(
-                [self.icd11_codes[i].split(".")[0] == parent_code for i in top_idx],
+                [self.code_parents[i] == parent_code for i in top_idx_cpu],
+                dtype=torch.bool,
                 device=self.device,
             )
             if mask.any():
@@ -119,6 +142,8 @@ class ModelProcessor:
             batch_size=128,
             show_progress_bar=False,
         )
+        # ✅ Only normalize if embeddings aren't already normalized
+        # Check your embedding model documentation - many models return normalized vectors
         encoded = F.normalize(encoded, dim=1)
 
         # -------------------------------------------------------------------------
@@ -129,38 +154,43 @@ class ModelProcessor:
         # -------------------------------------------------------------------------
         # ✅ Step 3. Compile metadata for top matches according to framework
         # -------------------------------------------------------------------------
+        # ✅ Move tensors to CPU once and clamp scores
+        final_idx_cpu = final_idx.cpu().tolist()
+        final_score_cpu = torch.clamp(final_score, max=1.0).cpu().tolist()
+        
         results = []
         for i, disease in enumerate(diseases):
-            idx = int(final_idx[i].item())
-            score = min(float(final_score[i].item()), 1.0)
+            idx = final_idx_cpu[i]
+            score = round(final_score_cpu[i], 4)
 
             if framework == "icd11":
                 code = self.icd11_codes[idx]
                 title = (
-                    self.icd11_titles[idx] if hasattr(self, "icd11_titles") else None
+                    self.icd11_titles[idx] if self.icd11_titles is not None else None
                 )
-                chapter = self.chapters[idx] if hasattr(self, "chapters") else None
-                uri = self.icd11_uris[idx] if hasattr(self, "icd11_uris") else None
+                chapter = self.chapters[idx] if self.chapters is not None else None
+                uri = self.icd11_uris[idx] if self.icd11_uris is not None else None
 
             elif framework == "icd10":
-                code = self.icd10_codes[idx] if hasattr(self, "icd10_codes") else None
+                code = self.icd10_codes[idx] if self.icd10_codes is not None else None
                 title = (
-                    self.icd10_titles[idx] if hasattr(self, "icd10_titles") else None
+                    self.icd10_titles[idx] if self.icd10_titles is not None else None
                 )
-                chapter = self.chapters[idx] if hasattr(self, "chapters") else None
+                chapter = self.chapters[idx] if self.chapters is not None else None
                 uri = ""
                 synonym = ""
 
             elif framework == "snomed":
-                code = self.snomed_codes[idx] if hasattr(self, "snomed_codes") else None
+                code = self.snomed_codes[idx] if self.snomed_codes is not None else None
                 title = (
-                    self.snomed_titles[idx] if hasattr(self, "snomed_titles") else None
+                    self.snomed_titles[idx] if self.snomed_titles is not None else None
                 )
                 chapter = ""
                 uri = ""
                 synonym = ""
-                # if the first character of the code is a ( then add warning message that this is actually an ICD 11 code
-            if code and str(code.strip()).startswith("("):
+            
+            # ✅ Use pre-computed set for faster parenthesis check
+            if idx in self.codes_with_paren:
                 self.logger.warning(
                     f"⚠️ The matched {framework} code '{code}' is an ICD-11 code."
                 )
@@ -177,7 +207,7 @@ class ModelProcessor:
                         if uri
                         else None
                     ),
-                    "Similarity": round(score, 4),
+                    "Similarity": score,
                 }
             )
 
@@ -190,6 +220,7 @@ class ModelProcessor:
     # NER and batch processing
     # -----------------------------------------------------
     def _process_batch(self, examples):
+        # ✅ Only lowercase if your NER model requires it
         texts = [t.lower() for t in examples[self.text_column]]
         ner_results = self.model(texts)
         all_diseases = []
@@ -230,14 +261,14 @@ class ModelProcessor:
     # -----------------------------------------------------
     def predict(self, dataset, batch_size=64):
         date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        processed_dataset = dataset.map(
-            self._process_batch,
-            batched=True,
-            batch_size=batch_size,
-            desc=f"[{date_time} | INFO | PetCoder]",
-            load_from_cache_file=False,
-        )
-        self.logger.info("Predictions obtained and text coded successfully.")
+        with logging_redirect_tqdm():
+            processed_dataset = dataset.map(
+                self._process_batch,
+                batched=True,
+                batch_size=batch_size,
+                desc=f"[{date_time} | INFO | PetCoder]",
+                load_from_cache_file=False,
+            )
         return processed_dataset
 
     def single_predict(self, dataset):
