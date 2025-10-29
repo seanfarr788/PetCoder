@@ -18,6 +18,7 @@ class ModelProcessor:
         label_column="ICD_11_code",
         embedding_model=None,
         device=None,
+        batch_size=256,
     ):
         self.model = model
         self.replaced = replaced
@@ -27,52 +28,60 @@ class ModelProcessor:
         self.device = (
             device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
         )
+        self.batch_size = batch_size
         self.framework = framework
         self.logger = get_logger()
+        if self.framework is not None:
+            self.lookup_embeddings = icd_embedding["lookup_embeddings"].to(self.device)
+            self.icd11_codes = icd_embedding["icd11Code"]
+            self.icd11_titles = icd_embedding.get("icd11Title", None)
+            self.title_synonyms = icd_embedding.get("Title_synonym", None)
+            self.icd11_uris = icd_embedding.get("icd11URI", None)
+            self.chapters = icd_embedding.get("ChapterNo", None)
+            self.icd10_codes = icd_embedding.get("icd10Code", None)
+            self.icd10_titles = icd_embedding.get("icd10Title", None)
+            self.snomed_codes = icd_embedding.get("snomedCode", None)
+            self.snomed_titles = icd_embedding.get("snomedTitle", None)
 
-        self.lookup_embeddings = icd_embedding["lookup_embeddings"].to(self.device)
-        self.icd11_codes = icd_embedding["icd11Code"]
-        self.icd11_titles = icd_embedding.get("icd11Title", None)
-        self.title_synonyms = icd_embedding.get("Title_synonym", None)
-        self.icd11_uris = icd_embedding.get("icd11URI", None)
-        self.chapters = icd_embedding.get("ChapterNo", None)
-        self.icd10_codes = icd_embedding.get("icd10Code", None)
-        self.icd10_titles = icd_embedding.get("icd10Title", None)
-        self.snomed_codes = icd_embedding.get("snomedCode", None)
-        self.snomed_titles = icd_embedding.get("snomedTitle", None)
+            self.num_codes = len(self.icd11_codes)
 
-        self.num_codes = len(self.icd11_codes)
+            self.parent_to_subcodes = {
+                k: v.to(self.device)
+                for k, v in zip(
+                    icd_embedding["parent_to_subcodes_keys"],
+                    icd_embedding["parent_to_subcodes_values"],
+                )
+            }
 
-        self.parent_to_subcodes = {
-            k: v.to(self.device)
-            for k, v in zip(
-                icd_embedding["parent_to_subcodes_keys"],
-                icd_embedding["parent_to_subcodes_values"],
-            )
-        }
+            self.z_code_mask = icd_embedding["z_code_mask"].to(self.device)
 
-        self.z_code_mask = icd_embedding["z_code_mask"].to(self.device)
-        
-        # ✅ Pre-compute parent codes for faster matching
-        self.code_parents = [code.split(".")[0] for code in self.icd11_codes]
-        
-        # ✅ Pre-identify codes starting with "(" for warning optimization
-        self.codes_with_paren = {
-            i for i, code in enumerate(self.icd11_codes) 
-            if str(code).strip().startswith("(")
-        }
-        if self.icd10_codes:
-            self.codes_with_paren.update({
-                i for i, code in enumerate(self.icd10_codes) 
+            # ✅ Pre-compute parent codes for faster matching
+            self.code_parents = [code.split(".")[0] for code in self.icd11_codes]
+
+            # ✅ Pre-identify codes starting with "(" for warning optimization
+            self.codes_with_paren = {
+                i
+                for i, code in enumerate(self.icd11_codes)
                 if str(code).strip().startswith("(")
-            })
-        if self.snomed_codes:
-            self.codes_with_paren.update({
-                i for i, code in enumerate(self.snomed_codes) 
-                if str(code).strip().startswith("(")
-            })
-        
-        self.logger.info(f"✅ Loaded {self.num_codes} ICD codes on {self.device}.")
+            }
+            if self.icd10_codes:
+                self.codes_with_paren.update(
+                    {
+                        i
+                        for i, code in enumerate(self.icd10_codes)
+                        if str(code).strip().startswith("(")
+                    }
+                )
+            if self.snomed_codes:
+                self.codes_with_paren.update(
+                    {
+                        i
+                        for i, code in enumerate(self.snomed_codes)
+                        if str(code).strip().startswith("(")
+                    }
+                )
+
+            self.logger.info(f"✅ Loaded {self.num_codes} ICD codes on {self.device}.")
 
     # -----------------------------------------------------
     # Internal similarity computation
@@ -139,7 +148,7 @@ class ModelProcessor:
             diseases,
             convert_to_tensor=True,
             device=self.device if torch.cuda.is_available() else None,
-            batch_size=128,
+            batch_size=self.batch_size,
             show_progress_bar=False,
         )
         # ✅ Only normalize if embeddings aren't already normalized
@@ -157,7 +166,7 @@ class ModelProcessor:
         # ✅ Move tensors to CPU once and clamp scores
         final_idx_cpu = final_idx.cpu().tolist()
         final_score_cpu = torch.clamp(final_score, max=1.0).cpu().tolist()
-        
+
         results = []
         for i, disease in enumerate(diseases):
             idx = final_idx_cpu[i]
@@ -178,7 +187,6 @@ class ModelProcessor:
                 )
                 chapter = self.chapters[idx] if self.chapters is not None else None
                 uri = ""
-                synonym = ""
 
             elif framework == "snomed":
                 code = self.snomed_codes[idx] if self.snomed_codes is not None else None
@@ -187,13 +195,11 @@ class ModelProcessor:
                 )
                 chapter = ""
                 uri = ""
-                synonym = ""
-            
-            # ✅ Use pre-computed set for faster parenthesis check
-            if idx in self.codes_with_paren:
-                self.logger.warning(
-                    f"⚠️ The matched {framework} code '{code}' is an ICD-11 code."
-                )
+
+            # if idx in self.codes_with_paren:
+            #     self.logger.warning(
+            #         f"⚠️ The matched {framework} code '{code}' is an ICD-11 code."
+            #     )
 
             results.append(
                 {
@@ -245,28 +251,35 @@ class ModelProcessor:
             batch_symptoms.append(list(symptoms))
             batch_pathogens.append(list(pathogens))
 
-        if all_diseases:
-            coded = self.disease_coder_batch(all_diseases)
-            batch_diseases = [coded[s:e] for s, e in disease_spans]
+        # -------------------------------------------------
+        # ✅ If framework=None, skip ICD/SNOMED coding
+        # -------------------------------------------------
+        if self.framework is None:
+            batch_diseases = [
+                [{"Entity": d} for d in all_diseases[s:e]] for s, e in disease_spans
+            ]
         else:
-            batch_diseases = [[] for _ in range(len(texts))]
+            if all_diseases:
+                coded = self.disease_coder_batch(all_diseases, framework=self.framework)
+                batch_diseases = [coded[s:e] for s, e in disease_spans]
+            else:
+                batch_diseases = [[] for _ in range(len(texts))]
 
         return {
             "disease_extraction": batch_diseases,
             "pathogen_extraction": batch_pathogens,
             "symptom_extraction": batch_symptoms,
-            # self.label_column: batch_diseases,
         }
 
     # -----------------------------------------------------
-    def predict(self, dataset, batch_size=64):
+    def predict(self, dataset):
         date_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         with logging_redirect_tqdm():
             processed_dataset = dataset.map(
                 self._process_batch,
                 batched=True,
-                batch_size=batch_size,
-                desc=f"[{date_time} | INFO | PetCoder]",
+                batch_size=self.batch_size,
+                desc=f"[{date_time} |   INFO  | PetCoder]",
                 load_from_cache_file=False,
             )
         return processed_dataset

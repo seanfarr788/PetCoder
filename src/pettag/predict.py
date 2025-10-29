@@ -5,233 +5,256 @@ from datasets import Dataset, load_dataset
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 from collections import defaultdict
-
-from torch.nn import functional as F
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 import torch
-import logging
+import torch.nn.functional as F
 import pandas as pd
 import numpy as np
-import os
 import json
+import os
+from datasets import Dataset, load_dataset
+from functools import lru_cache
 
 
 class DiseaseCoder:
     """Anonymises text data using a pre-trained model.
 
     Args:
-        dataset (Union[str, Dataset], optional): Path to dataset file (CSV, Arrow, etc.) or a HuggingFace Dataset.
-        split (str): Dataset split to use ('train', 'test', etc.). Defaults to 'train'.
-        model (str): HuggingFace model path or name. Defaults to 'SAVSNET/PetHarbor'.
-        tokenizer (str, optional): Tokenizer path or name. Defaults to model if not provided.
-        text_column (str): Column in dataset containing text. Defaults to 'text'.
+        framework (str): Coding framework ('icd11', 'icd10', 'snomed'). Defaults to 'icd11'.
+        dataset (Union[str, Dataset], optional): Path to dataset file or HuggingFace Dataset.
+        split (str): Dataset split to use. Defaults to 'train'.
+        model (str): HuggingFace model path. Defaults to 'seanfarrell/bert-base-uncased'.
+        tokenizer (str, optional): Tokenizer path. Defaults to model if not provided.
+        batch_size (int): Batch size for processing. Defaults to 16.
+        synonyms_dataset (str): Path to synonyms dataset.
+        synonyms_embeddings_dataset (str): Path to precomputed embeddings.
+        embedding_model (str): Sentence transformer model name.
+        text_column (str): Column containing text. Defaults to 'text'.
+        label_column (str): Column containing labels. Defaults to 'labels'.
         cache (bool): Whether to use caching. Defaults to True.
-        cache_path (str): Directory to store cache files. Defaults to 'petharbor_cache/'.
-        logs (str, optional): Path to save logs. If None, logs to console.
-        device (str, optional): Device to use for computation. Defaults to 'cuda' if available else 'cpu'.
-        tag_map (Dict[str, str], optional): Entity tag to replacement string mapping.
-        output_dir (str, optional): Directory to save output dataset.
+        cache_path (str): Cache directory. Defaults to 'petharbor_cache/'.
+        logs (str, optional): Path to save logs.
+        device (str, optional): Computation device. Auto-detected if None.
+        output_dir (str, optional): Output directory for results.
     """
 
     def __init__(
         self,
-        framework: str = 'icd11', #options: 'icd11', 'icd10', 'snomed'
-        dataset: str = None,  # Path to the dataset file (CSV, Arrow, etc.)
-        split: str = "train",  # Split of the dataset to use (e.g., 'train', 'test', 'eval')
-        model: str = "seanfarrell/bert-base-uncased",  # Path to the model
-        tokenizer: str = None,  # Path to the tokenizer
-        synonyms_dataset="seanfarrell/ICD-11_synonyms",
-        synonyms_embeddings_dataset="cache/ICD-11_synonyms_embeddings.pt",
+        framework: str = 'icd11',
+        dataset: Optional[Union[str, Dataset]] = None,
+        split: str = "train",
+        model: str = "seanfarrell/bert-base-uncased",
+        tokenizer: Optional[str] = None,
+        batch_size: int = 16,
+        synonyms_dataset: str = "seanfarrell/ICD-11_synonyms",
+        synonyms_embeddings_dataset: str = "cache/ICD-11_synonyms_embeddings.pt",
         embedding_model: str = "sentence-transformers/embeddinggemma-300m-medical",
-        text_column: str = "text",  # Column name in the dataset containing text data
-        label_column: str = "labels",  # Column name in the dataset containing labels
-        cache: bool = True,  # Whether to use cache
-        cache_path: str = "petharbor_cache/",  # Path to save cache files
-        logs: Optional[str] = None,  # Path to save logs
-        device: Optional[str] = "cuda:0" if torch.cuda.is_available() else "cpu",
-        output_dir: str = None,  # Directory to save the output files
+        text_column: str = "text",
+        label_column: str = "labels",
+        cache: bool = True,
+        cache_path: str = "petharbor_cache/",
+        logs: Optional[str] = None,
+        device: Optional[str] = None,
+        output_dir: Optional[str] = None,
     ):
+        # Core attributes
         self.framework = framework
         self.dataset = dataset
         self.split = split
-        self.tokenizer = tokenizer if tokenizer else model
         self.text_column = text_column
         self.label_column = label_column
+        self.batch_size = batch_size
         self.cache = cache
         self.cache_path = cache_path
         self.logs = logs
-        self.device = device
         self.output_dir = output_dir
+        self.num_runs = 0
+        
+        # Device setup with optimization
+        if device is None:
+            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+        
+        # Logger setup
         self.logger = self._setup_logger()
-
+        
+        # Dataset processor (lazy init if needed)
         self.dataset_processor = DatasetProcessor(cache_path=self.cache_path)
-        self.logger.info(f"Initializing NER pipeline. Using {device}.")
+        
+        # Model initialization with optimizations
+        self.logger.info(f"Initializing NER pipeline on {self.device}")
+        dtype = torch.float16 if "cuda" in self.device else torch.float32
+        
         self.model = pipeline(
             "token-classification",
             model=model,
-            tokenizer=self.tokenizer,
+            tokenizer=tokenizer or model,
             aggregation_strategy="simple",
             device=self.device,
-            dtype=torch.float16 if "cuda" in self.device else torch.float32,
+            batch_size=batch_size,  # Enable batching in pipeline
+            dtype=dtype,
         )
+        
+        # Embedding model initialization
         self.logger.info("Initializing embedding pipeline")
-        self.embedding_model = SentenceTransformer(embedding_model).to(self.device)
-
-        try:
-            self.logger.info(
-                f"Loading precomputed ICD lookup from {synonyms_embeddings_dataset} ..."
+        self.embedding_model = SentenceTransformer(embedding_model, device=self.device)
+        
+        # Use compile for PyTorch 2.0+ speedup
+        if hasattr(torch, 'compile') and "cuda" in self.device:
+            try:
+                self.embedding_model = torch.compile(self.embedding_model, mode="reduce-overhead")
+            except Exception as e:
+                self.logger.warning(f"Could not compile embedding model: {e}")
+        
+        # ICD lookup initialization
+        icd_data = None
+        if framework:
+            icd_data = self._load_or_create_icd_lookup(
+                synonyms_dataset, synonyms_embeddings_dataset
             )
-            data = torch.load(
-                synonyms_embeddings_dataset, map_location=self.device, weights_only=True
-            )
-        except:
-            self.logger.info(
-                "No ICD embedding store found. Generating a new one. This should only happen on first run. Should take a few minutes..."
-            )
-            icd_lookup_daaset = load_dataset(synonyms_dataset, split="train", download_mode='force_redownload')
-            data = self._preprocess_icd_lookup(
-                disease_code_lookup=icd_lookup_daaset,
-                save_path=synonyms_embeddings_dataset,
-            )
-
-        self.logger.info(f"Initializing {self.framework.upper()} ModelProcessor")
+            self.logger.info(f"Initialized {framework.upper()} ModelProcessor")
+        else:
+            self.logger.warning("framework=None specified. NER extraction only.")
+        
+        # Model processor
         self.model_processor = ModelProcessor(
             framework=self.framework,
             model=self.model,
-            icd_embedding=data,
-            text_column=self.text_column,
-            label_column=self.label_column,
+            icd_embedding=icd_data,
+            text_column=text_column,
+            label_column=label_column,
             embedding_model=self.embedding_model,
             device=self.device,
+            batch_size=batch_size,
         )
-        self.num_runs = 0
 
     def _setup_logger(self) -> Any:
+        """Setup logger with lazy import."""
         return get_logger(log_dir=self.logs) if self.logs else get_logger()
 
-    def _print_output(self, input_text: str, output_text: str):
-        timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        pretty_output = json.dumps(output_text, indent=4, ensure_ascii=False, sort_keys=True)
+    def _load_or_create_icd_lookup(
+        self, synonyms_dataset: str, synonyms_embeddings_dataset: str
+    ) -> Dict[str, Any]:
+        """Load precomputed embeddings or create new ones."""
+        try:
+            self.logger.info(f"Loading ICD lookup from {synonyms_embeddings_dataset}")
+            data = torch.load(
+                synonyms_embeddings_dataset,
+                map_location=self.device,
+                weights_only=True
+            )
+            # Move tensors to device efficiently
+            return {
+                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in data.items()
+            }
+        except (FileNotFoundError, Exception) as e:
+            self.logger.info(
+                "Generating new ICD embedding store (first run only, may take a few minutes)"
+            )
+            icd_dataset = load_dataset(
+                synonyms_dataset,
+                split="train",
+                download_mode='force_redownload'
+            )
+            return self._preprocess_icd_lookup(icd_dataset, synonyms_embeddings_dataset)
 
-        print(f"[{timestamp} | SUCCESS | PetCoder] Input:  {input_text}")
-        print(f"[{timestamp} | SUCCESS | PetCoder] Output:\n{pretty_output}")
-
-    def _prepare_single_text(self, text: str) -> Dataset:
-        if not isinstance(text, str):
-            error_message = "Input text must be a string."
-            self.logger.error(error_message)
-            raise ValueError(error_message)
-        clean_text = text.strip()
-        df = pd.DataFrame({self.text_column: [clean_text]})
-        return Dataset.from_pandas(df)
-
-        # -----------------------------------------------------
-
-    # Create Embedding Store
-    # -----------------------------------------------------
-
-    def _preprocess_icd_lookup(self, disease_code_lookup, save_path="icd_lookup.pt"):
+    def _preprocess_icd_lookup(
+        self, disease_code_lookup, save_path: str = "icd_lookup.pt"
+    ) -> Dict[str, Any]:
         """
-        Preprocess an ICD lookup table into a compact, normalized, and efficiently loadable
-        PyTorch dictionary. The resulting .pt file includes:
-        - Normalized embeddings
-        - Metadata (ICD11, ICD10, SNOMED)
-        - Parent–subcode index mappings
-        - .Z code mask
-
-        Parameters
-        ----------
-        disease_code_lookup : pandas.DataFrame or dict-like
-            ICD lookup data containing at least the columns:
-            ['icd11Code', 'icd11Title', 'Title_synonym', 'icd11URI', 'embeddings',
-            'ChapterNo', 'icd10Code', 'icd10Title', 'snomedCode', 'snomedTitle'].
-        save_path : str, optional
-            Output path for the saved lookup file (default: "icd_lookup.pt").
-
-        Returns
-        -------
-        dict
-            A dictionary containing tensors and metadata ready for downstream use.
+        Preprocess ICD lookup into optimized PyTorch format.
+        
+        Returns normalized embeddings with metadata for fast lookup.
         """
+        self.logger.info("Preprocessing ICD lookup into PyTorch format...")
 
-        self.logger.info("📦 Preprocessing ICD lookup into safe PyTorch format...")
-
-        # -------------------------------------------------------------------------
-        # ✅ Step 1. Normalize embeddings
-        # -------------------------------------------------------------------------
-        embeddings = torch.tensor( np.asarray(disease_code_lookup["embeddings"], dtype=np.float32) ) 
+        # Extract and normalize embeddings efficiently
+        embeddings = torch.tensor(
+            np.asarray(disease_code_lookup["embeddings"], dtype=np.float32),
+            dtype=torch.float32
+        )
         embeddings = F.normalize(embeddings, dim=1)
         self.logger.info(f"Embeddings shape: {embeddings.shape}")
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 2. Extract metadata columns
-        # -------------------------------------------------------------------------
-        icd11_codes = [str(c) for c in disease_code_lookup["icd11Code"]]
-        icd11_titles = [str(t) for t in disease_code_lookup["icd11Title"]]
-        synonyms = [str(s) for s in disease_code_lookup["Title_synonym"]]
-        uris = [str(u) for u in disease_code_lookup["icd11URI"]]
-        chapters = [str(ch) for ch in disease_code_lookup["ChapterNo"]]
-        icd10_codes = [str(c) for c in disease_code_lookup["icd10Code"]]
-        icd10_titles = [str(t) for t in disease_code_lookup["icd10Title"]]
-        snomed_codes = [str(c) for c in disease_code_lookup["snomedCode"]]
-        snomed_titles = [str(t) for t in disease_code_lookup["snomedTitle"]]
+        # Extract metadata (vectorized where possible)
+        metadata_fields = {
+            "icd11Code": "icd11Code",
+            "icd11Title": "icd11Title",
+            "Title_synonym": "Title_synonym",
+            "icd11URI": "icd11URI",
+            "ChapterNo": "ChapterNo",
+            "icd10Code": "icd10Code",
+            "icd10Title": "icd10Title",
+            "snomedCode": "snomedCode",
+            "snomedTitle": "snomedTitle",
+        }
+        
+        metadata = {
+            key: [str(c) for c in disease_code_lookup[field]]
+            for key, field in metadata_fields.items()
+        }
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 3. Build parent → subcode mapping (based on ICD-11 code)
-        # -------------------------------------------------------------------------
+        # Build parent → subcode mapping efficiently
+        icd11_codes = metadata["icd11Code"]
         parent_groups = {}
         for idx, code in enumerate(icd11_codes):
             parent = code.split(".")[0]
             parent_groups.setdefault(parent, []).append(idx)
 
-        parent_to_subcodes_keys, parent_to_subcodes_values = [], []
+        parent_to_subcodes_keys = []
+        parent_to_subcodes_values = []
         for parent, indices in parent_groups.items():
             if len(indices) > 1:
                 parent_to_subcodes_keys.append(parent)
                 parent_to_subcodes_values.append(torch.tensor(indices, dtype=torch.long))
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 4. Create a ".Z" code mask (terminal ICD-11 codes)
-        # -------------------------------------------------------------------------
-        z_code_mask = torch.tensor([c.endswith(".Z") for c in icd11_codes], dtype=torch.bool)
+        # Create .Z code mask
+        z_code_mask = torch.tensor(
+            [c.endswith(".Z") for c in icd11_codes],
+            dtype=torch.bool
+        )
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 5. Handle save path and ensure directory exists
-        # -------------------------------------------------------------------------
+        # Ensure save path
         save_path = save_path if save_path.endswith(".pt") else f"{save_path}.pt"
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 6. Save lookup dictionary
-        # -------------------------------------------------------------------------
+        # Create lookup dictionary
         lookup_dict = {
             "lookup_embeddings": embeddings.cpu(),
-            "icd11Code": icd11_codes,
-            "icd11Title": icd11_titles,
-            "Title_synonym": synonyms,
-            "icd11URI": uris,
-            "ChapterNo": chapters,
-            "icd10Code": icd10_codes,
-            "icd10Title": icd10_titles,
-            "snomedCode": snomed_codes,
-            "snomedTitle": snomed_titles,
             "parent_to_subcodes_keys": parent_to_subcodes_keys,
             "parent_to_subcodes_values": parent_to_subcodes_values,
-            "z_code_mask": z_code_mask,
+            "z_code_mask": z_code_mask.cpu(),
+            **metadata,
         }
 
         torch.save(lookup_dict, save_path)
-        self.logger.info(f"💾 ICD lookup saved successfully → {save_path}")
+        self.logger.info(f"ICD lookup saved to {save_path}")
 
-        # -------------------------------------------------------------------------
-        # ✅ Step 7. Return device-ready dictionary
-        # -------------------------------------------------------------------------
+        # Return device-ready dictionary
         return {
-            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
-            for key, value in lookup_dict.items()
+            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in lookup_dict.items()
         }
 
-    def _prepare_dataset(self) -> Dataset:
+    @lru_cache(maxsize=128)
+    def _prepare_single_text_cached(self, text: str) -> Dataset:
+        """Cache single text preparations for repeated calls."""
+        df = pd.DataFrame({self.text_column: [text.strip()]})
+        return Dataset.from_pandas(df)
+
+    def _prepare_single_text(self, text: str) -> Dataset:
+        """Prepare single text input with validation."""
+        if not isinstance(text, str):
+            error_msg = "Input text must be a string."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        return self._prepare_single_text_cached(text)
+
+    def _prepare_dataset(self) -> tuple[Dataset, Dataset]:
+        """Load and validate dataset with caching."""
         if isinstance(self.dataset, Dataset):
             original_data = self.dataset
         elif isinstance(self.dataset, str):
@@ -239,87 +262,118 @@ class DiseaseCoder:
                 self.dataset, split=self.split
             )
         else:
-            raise ValueError("`dataset` must be a filepath or a HuggingFace Dataset.")
+            raise ValueError("`dataset` must be a filepath or HuggingFace Dataset.")
 
         validated = self.dataset_processor.validate_dataset(
             dataset=original_data, text_column=self.text_column
         )
-        completed_dataset, target_dataset = self.dataset_processor.load_cache(
-            dataset=validated, cache=self.cache
+        
+        return self.dataset_processor.load_cache(dataset=validated, cache=self.cache)
+
+    def _print_output(self, input_text: str, output_data: Any) -> None:
+        """Print formatted output."""
+        timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        pretty_output = json.dumps(
+            output_data, indent=4, ensure_ascii=False, sort_keys=True
         )
-        return completed_dataset, target_dataset
+        print(f"[{timestamp} | SUCCESS | PetCoder] Input:  {input_text}")
+        print(f"[{timestamp} | SUCCESS | PetCoder] Output:\n{pretty_output}")
 
-    def _run(
-        self,
-        text: str = None,
-        dataset: str = None,
-    ) -> None:
-        """Coder the single text data or in a dataset and output/saves the results.
-
+    def _run(self, text: Optional[str] = None, dataset: Optional[str] = None) -> Any:
+        """
+        Internal method to code text or dataset.
+        
         Args:
-        text (str, optional): Text to code
-        dataset (str, optional): Path to the dataset file (CSV, Arrow, etc.)
-
-        Raises:
-        ValueError: If both text and dataset are provided or neither is provided.
-
+            text: Single text string to code
+            dataset: Path to dataset file
+            
+        Returns:
+            Coded output for text, None for dataset (saves to file)
         """
         self.num_runs += 1
+        
+        # Validation
         if text and self.dataset:
-            raise ValueError(
-                "Please provide either a text string or a dataset path, not both."
-            )
+            raise ValueError("Provide either text or dataset, not both.")
+        
         # Prepare input
-        if text:  # If text is provided
-            self.logger.warning(
-                "Coding single text input. For bulk processing, use a dataset."
-            )
-            target_dataset = self._prepare_single_text(text)
-        elif dataset:  # If dataset is provided to class
-            self.dataset = dataset
-            target_dataset, completed_dataset = self._prepare_dataset()
-        elif self.dataset:  # If dataset is initialized
-            target_dataset, completed_dataset = self._prepare_dataset()
-        else:
-            raise ValueError("Please provide either a text string or a dataset path.")
         if text:
-            target_dataset = self.model_processor.single_predict(dataset=target_dataset)
-            self._print_output(text, target_dataset[0])
-            return target_dataset[0]
-        else:
-            target_dataset = self.model_processor.predict(
-                dataset=target_dataset, batch_size=16
-            )
-            self.dataset_processor.save_dataset_file(
-                target_dataset=target_dataset,
-                completed_dataset=completed_dataset,
-                cache=self.cache,
-                output_dir=self.output_dir,
-            )
+            self.logger.warning("Coding single text. Use dataset for bulk processing.")
+            target_dataset = self._prepare_single_text(text)
+            result = self.model_processor.single_predict(dataset=target_dataset)
+            self._print_output(text, result[0])
+            return result[0]
+        
+        # Dataset processing
+        if dataset:
+            self.dataset = dataset
+        
+        if not self.dataset:
+            raise ValueError("Provide either text string or dataset path.")
+        
+        completed_dataset, target_dataset = self._prepare_dataset()
+        processed = self.model_processor.predict(dataset=target_dataset)
+        
+        self.dataset_processor.save_dataset_file(
+            target_dataset=processed,
+            completed_dataset=completed_dataset,
+            cache=self.cache,
+            output_dir=self.output_dir,
+        )
+        return None
 
-    def predict(self, text: str = None, dataset: str = None) -> Optional[str]:
+    def predict(
+        self, text: Optional[str] = None, dataset: Optional[str] = None
+    ) -> Optional[Any]:
         """
-        Anonymises text data.
-
-        n.b 'anonymise' method overwrites the text column if a dataset is provided.
-        If only text is provided, the anonymised text is returned.
+        Predict on provided text or dataset.
+        
+        Args:
+            text: Single text string to code
+            dataset: Path to dataset file
+            
+        Returns:
+            Coded output for text, None for dataset operations
         """
         if self.num_runs > 1:
             self.logger.warning(
-                "It appears you are sequentially running the model. Reccomended: Pass 'dataset' to the class."
+                "Sequential model runs detected. Consider passing 'dataset' to class init."
             )
 
-        if dataset is None:
-            dataset = self.dataset
+        dataset = dataset or self.dataset
+        
         if text is not None:
             return self._run(text=text, dataset=None)
         elif dataset is not None:
             self._run(text=None, dataset=dataset)
-            return None  # Explicitly return None when operating on the dataset
+            return None
         else:
-            self.logger.warning("No text or dataset provided for anonymisation.")
+            self.logger.warning("No text or dataset provided.")
             return None
 
+    @torch.inference_mode()
+    def predict_batch(self, texts: list[str]) -> list[Any]:
+        """
+        Efficiently predict on multiple texts at once.
+        
+        Args:
+            texts: List of text strings to code
+            
+        Returns:
+            List of coded outputs
+        """
+        if not texts:
+            self.logger.warning("Empty text list provided.")
+            return []
+        
+        # Create temporary dataset
+        df = pd.DataFrame({self.text_column: texts})
+        temp_dataset = Dataset.from_pandas(df)
+        
+        # Process in batches
+        results = self.model_processor.predict(dataset=temp_dataset)
+        return results
+    
 if __name__ == "__main__":
     # Example usage
     coder = DiseaseCoder()
