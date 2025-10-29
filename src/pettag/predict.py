@@ -39,7 +39,7 @@ class DiseaseCoder:
 
     def __init__(
         self,
-        framework: str = 'icd11',
+        framework: str = "icd11",
         dataset: Optional[Union[str, Dataset]] = None,
         split: str = "train",
         model: str = "seanfarrell/bert-base-uncased",
@@ -66,23 +66,22 @@ class DiseaseCoder:
         self.logs = logs
         self.output_dir = output_dir
         self.num_runs = 0
-        
+
         # Device setup with optimization
         if device is None:
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
-        
+
         # Logger setup
         self.logger = self._setup_logger()
-        
+
         # Dataset processor
         self.dataset_processor = DatasetProcessor(cache=self.cache)
-        
+
         # Model initialization with optimizations
         self.logger.info(f"Initializing NER pipeline on {self.device}")
-        dtype = torch.float16 if "cuda" in self.device else torch.float32
-        
+
         self.model = pipeline(
             "token-classification",
             model=model,
@@ -90,24 +89,23 @@ class DiseaseCoder:
             aggregation_strategy="simple",
             device=self.device,
             batch_size=batch_size,  # Enable batching in pipeline
-            dtype=dtype,
+            dtype=torch.float16 if "cuda" in self.device else torch.float32,
         )
-        
+
         # Embedding model initialization
-        self.logger.info("Initializing embedding pipeline")
+        self.logger.info(f"Initializing {embedding_model} embedding pipeline")
         self.embedding_model = SentenceTransformer(embedding_model, device=self.device)
-        
+
         # Use compile for PyTorch 2.0+ speedup (optional)
-        if hasattr(torch, 'compile') and "cuda" in self.device:
+        if hasattr(torch, "compile") and "cuda" in self.device:
             try:
                 self.embedding_model = torch.compile(
-                    self.embedding_model, 
-                    mode="reduce-overhead"
+                    self.embedding_model, mode="reduce-overhead"
                 )
                 self.logger.info("Applied torch.compile() to embedding model")
             except Exception as e:
                 self.logger.warning(f"Could not compile embedding model: {e}")
-        
+
         # ICD lookup initialization
         icd_data = None
         if framework:
@@ -117,7 +115,7 @@ class DiseaseCoder:
             self.logger.info(f"Initialized {framework.upper()} ModelProcessor")
         else:
             self.logger.warning("framework=None specified. NER extraction only.")
-        
+
         # Model processor
         self.model_processor = ModelProcessor(
             framework=self.framework,
@@ -130,11 +128,14 @@ class DiseaseCoder:
             batch_size=batch_size,
         )
 
+    ######################## Logger Setup ########################
     def _setup_logger(self) -> Any:
         """Setup logger."""
         from pettag.utils.logging_setup import get_logger
+
         return get_logger(log_dir=self.logs) if self.logs else get_logger()
 
+    ######################## Embeddings Preperation ########################
     def _load_or_create_icd_lookup(
         self, synonyms_dataset: str, synonyms_embeddings_dataset: str
     ) -> Dict[str, Any]:
@@ -142,13 +143,15 @@ class DiseaseCoder:
         try:
             self.logger.info(f"Loading ICD lookup from {synonyms_embeddings_dataset}")
             data = torch.load(
-                synonyms_embeddings_dataset,
-                map_location=self.device,
-                weights_only=True
+                synonyms_embeddings_dataset, map_location=self.device, weights_only=True
             )
             # Move tensors to device efficiently with non_blocking
             return {
-                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                k: (
+                    v.to(self.device, non_blocking=True)
+                    if isinstance(v, torch.Tensor)
+                    else v
+                )
                 for k, v in data.items()
             }
         except (FileNotFoundError, Exception) as e:
@@ -156,9 +159,7 @@ class DiseaseCoder:
                 "Generating new ICD embedding store (first run only, may take a few minutes)"
             )
             icd_dataset = load_dataset(
-                synonyms_dataset,
-                split="train",
-                download_mode='force_redownload'
+                synonyms_dataset, split="train", download_mode="force_redownload"
             )
             return self._preprocess_icd_lookup(icd_dataset, synonyms_embeddings_dataset)
 
@@ -167,7 +168,7 @@ class DiseaseCoder:
     ) -> Dict[str, Any]:
         """
         Preprocess ICD lookup into optimized PyTorch format with normalized embeddings.
-        
+
         Optimizations:
         - Vectorized operations where possible
         - Single-pass parent grouping
@@ -178,14 +179,14 @@ class DiseaseCoder:
         # Extract and normalize embeddings efficiently
         embeddings = torch.tensor(
             np.asarray(disease_code_lookup["embeddings"], dtype=np.float32),
-            dtype=torch.float32
+            dtype=torch.float32,
         )
         embeddings = F.normalize(embeddings, dim=1)
         self.logger.info(f"Embeddings shape: {embeddings.shape}")
 
         # Extract metadata using vectorized operations
         icd11_codes = [str(c) for c in disease_code_lookup["icd11Code"]]
-        
+
         metadata = {
             "icd11Code": icd11_codes,
             "icd11Title": [str(t) for t in disease_code_lookup["icd11Title"]],
@@ -216,8 +217,7 @@ class DiseaseCoder:
 
         # Create .Z code mask efficiently
         z_code_mask = torch.tensor(
-            [c.endswith(".Z") for c in icd11_codes],
-            dtype=torch.bool
+            [c.endswith(".Z") for c in icd11_codes], dtype=torch.bool
         )
 
         # Ensure save path exists
@@ -238,9 +238,15 @@ class DiseaseCoder:
 
         # Return device-ready dictionary with async transfers
         return {
-            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            k: (
+                v.to(self.device, non_blocking=True)
+                if isinstance(v, torch.Tensor)
+                else v
+            )
             for k, v in lookup_dict.items()
         }
+
+    ######################## Dataset Preperation ########################
 
     def _prepare_single_text(self, text: str) -> Dataset:
         """Prepare single text input with validation."""
@@ -248,7 +254,7 @@ class DiseaseCoder:
             error_msg = "Input text must be a string."
             self.logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
         clean_text = text.strip()
         df = pd.DataFrame({self.text_column: [clean_text]})
         return Dataset.from_pandas(df)
@@ -269,12 +275,16 @@ class DiseaseCoder:
         )
         # if self.label_column not in validated.column_names add it
         if self.label_column not in validated.column_names:
-            validated = validated.add_column(self.label_column, ["" for _ in range(len(validated))])
-        
-        completed_dataset, target_dataset = self.dataset_processor.load_cache(
+            validated = validated.add_column(
+                self.label_column, ["" for _ in range(len(validated))]
+            )
+
+        target_dataset, completed_dataset = self.dataset_processor.load_cache(
             dataset=validated, cache_column=self.label_column
         )
-        return completed_dataset, target_dataset
+        return target_dataset, completed_dataset
+
+    ######################## Single Text Printing ########################
 
     def _print_output(self, input_text: str, output_data: Any) -> None:
         """Print formatted output."""
@@ -285,53 +295,53 @@ class DiseaseCoder:
         print(f"[{timestamp} | SUCCESS | PetCoder] Input:  {input_text}")
         print(f"[{timestamp} | SUCCESS | PetCoder] Output:\n{pretty_output}")
 
+    ################################################################################
+
     def _run(
-        self, 
-        text: Optional[str] = None, 
-        dataset: Optional[str] = None
+        self, text: Optional[str] = None, dataset: Optional[str] = None
     ) -> Optional[Any]:
         """
         Internal method to code text or dataset.
-        
+
         Args:
             text: Single text string to code
             dataset: Path to dataset file
-            
+
         Returns:
             Coded output for text, None for dataset (saves to file)
         """
         self.num_runs += 1
-        
+
         # Validation
         if text and self.dataset:
             raise ValueError("Provide either text or dataset, not both.")
-        
+
         # Process single text
         if text:
             self.logger.warning("Coding single text. Use dataset for bulk processing.")
             target_dataset = self._prepare_single_text(text)
             result = self.model_processor.single_predict(dataset=target_dataset)
-            
+
             # Extract the first row's output
             output = {
                 "disease_extraction": result["Code"][0],
                 "pathogen_extraction": result["pathogen_extraction"][0],
                 "symptom_extraction": result["symptom_extraction"][0],
             }
-            
+
             self._print_output(text, output)
             return output
-        
+
         # Process dataset
         if dataset:
             self.dataset = dataset
-        
+
         if not self.dataset:
             raise ValueError("Provide either text string or dataset path.")
-        
-        completed_dataset, target_dataset = self._prepare_dataset()
+
+        target_dataset, completed_dataset = self._prepare_dataset()
         processed = self.model_processor.predict(dataset=target_dataset)
-        
+
         self.dataset_processor.save_dataset_file(
             target_dataset=processed,
             completed_dataset=completed_dataset,
@@ -339,52 +349,18 @@ class DiseaseCoder:
         )
         return None
 
-    def predict_batch(self, texts: list) -> list:
-        """
-        Efficiently predict on multiple texts at once.
-        
-        Args:
-            texts: List of text strings to code
-            
-        Returns:
-            List of dictionaries containing extractions for each text
-        """
-        if not texts:
-            self.logger.warning("Empty text list provided.")
-            return []
-        
-        # Create temporary dataset
-        df = pd.DataFrame({self.text_column: texts})
-        temp_dataset = Dataset.from_pandas(df)
-        
-        # Process in batches through ModelProcessor
-        processed = self.model_processor.predict(dataset=temp_dataset)
-        
-        # Extract results for each text
-        results = []
-        for i in range(len(texts)):
-            results.append({
-                "disease_extraction": processed["disease_extraction"][i],
-                "pathogen_extraction": processed["pathogen_extraction"][i],
-                "symptom_extraction": processed["symptom_extraction"][i],
-            })
-        
-        return results
-    
     #################################################################################
-               
+
     def predict(
-        self, 
-        text: Optional[str] = None, 
-        dataset: Optional[str] = None
+        self, text: Optional[str] = None, dataset: Optional[str] = None
     ) -> Optional[Any]:
         """
         Predict on provided text or dataset.
-        
+
         Args:
             text: Single text string to code
             dataset: Path to dataset file
-            
+
         Returns:
             Dictionary with extractions for text input, None for dataset operations
         """
@@ -394,7 +370,7 @@ class DiseaseCoder:
             )
 
         dataset = dataset or self.dataset
-        
+
         if text is not None:
             return self._run(text=text, dataset=None)
         elif dataset is not None:
@@ -403,4 +379,3 @@ class DiseaseCoder:
         else:
             self.logger.warning("No text or dataset provided.")
             return None
-

@@ -143,17 +143,16 @@ class DatasetProcessor:
             # A. Filter for the 'target' dataset (rows to be processed/uncached)
             # Condition: The cache_column is an empty string (not completed)
             target_dataset = dataset.filter(
-                lambda example: example.get(cache_column, "") == "",
-                # Use 'desc' for better logging in large-scale operations
-                desc=f"[{timestamp} | SUCCESS | PetCoder] Filtering uncompleted rows based on '{cache_column}'",
+                lambda example: example.get(cache_column) in ["", None],
+                desc=f"[{timestamp} |  INFO  | PetCoder] Filtering target rows based on '{cache_column}'",
             )
 
             # B. Determine the 'completed' dataset by filtering for the opposite condition
             # This is more efficient than filtering the original dataset again.
             # Condition: The cache_column is a non-empty string (completed)
             completed_dataset = dataset.filter(
-                lambda example: example.get(cache_column, "") != "",
-                desc=f"[{timestamp} | SUCCESS | PetCoder] Filtering completed rows based on '{cache_column}'",
+                lambda example: example.get(cache_column) not in ["", None],
+                desc=f"[{timestamp} |  INFO  | PetCoder] Filtering completed rows based on '{cache_column}'",
             )
 
             target_count = len(target_dataset)
@@ -232,12 +231,12 @@ class DatasetProcessor:
                 logging.info(
                     "No original input format found, defaulting to CSV for saving."
                 )
-            base_name = f"petharbor_Coded_{date}{save_format}"
+            base_name = f"PetTag_{date}{save_format}"
             save_path = os.path.join(output_dir, base_name)
         else:
             # Default if no output_dir provided
             save_format = ".csv"
-            save_path = f"petharbor_Coded_{date}.csv"
+            save_path = f"PetTag_{date}.csv"
 
         logging.info(f"Saving dataset using format: {save_format}")
 
@@ -270,5 +269,5 @@ class DatasetProcessor:
             self.logger.error(
                 f"Failed to save dataset to {save_path}: {e}. Aborting, saving output as petharbor_anonymised.csv to current directory"
             )
-            target_df.to_csv("petharbor_anonymised.csv", index=False)
+            target_df.to_csv(f"PetTag_inference.csv", index=False)
             raise
