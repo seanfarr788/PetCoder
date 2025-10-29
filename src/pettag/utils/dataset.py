@@ -110,7 +110,7 @@ class DatasetProcessor:
             self.logger.error(error_message)
             raise ValueError(error_message)
 
-    def load_cache(self, dataset, cache_column='label') -> tuple:
+    def load_cache(self, dataset, cache_column="label") -> tuple:
         """
         Filter out anonymised data from the dataset using a cache.
 
@@ -130,18 +130,15 @@ class DatasetProcessor:
             try:
                 # If the goal is: Non-empty string means "completed"
                 completed_dataset = dataset.filter(
-                    lambda example: example.get(label_column, "") != "" # Use "" as a safe default
+                    lambda example: example.get(label_column, "")
+                    != ""  # Use "" as a safe default
                 )
 
                 # Target: The column is an empty string (not completed)
                 target_dataset = dataset.filter(
-                    lambda example: example.get(label_column, "") == "" # Use "" as a safe default
+                    lambda example: example.get(label_column, "")
+                    == ""  # Use "" as a safe default
                 )
-                else 
-                    raise ValueError(
-                        "`cache` must be either a boolean."
-                    )
-
                 self.logger.info(
                     f"Cache enabled | Skipping {len(completed_dataset)} Coded rows | Processing {len(target_dataset)} rows"
                 )
